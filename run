@@ -1,0 +1,9 @@
+#make
+#./compile
+
+objdump -t $1 | grep '\.rodata' > data.txt
+objdump -t $1 | grep '\.data' >> data.txt
+objdump -t $1 | grep '\.bss' >> data.txt
+./globalvariable data.txt variable_info.txt
+#./run64 coach $1 $2 $3 $4 $5 $6 $7 $8 $9
+./run32 coach $1 $2 $3 $4 $5 $6 $7 $8 $9

@@ -1,0 +1,5 @@
+
+objdump -t $1 | grep '\.rodata' > data.txt
+objdump -t $1 | grep '\.data' >> data.txt
+objdump -t $1 | grep '\.bss' >> data.txt
+./globalvariable data.txt variable_info.txt
