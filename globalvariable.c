@@ -52,7 +52,7 @@ int main(int argc, char *argv[])
 			continue;
 
 		// now global variable
-		sscanf(line, "%lx %c %c %s %x %s", &addr, &c1, &c2, &section, &size, &name[0]);
+		sscanf(line, "%lx %c %c %s %x %s", &addr, &c1, &c2, section, &size, &name[0]);
 		if (strcmp(section, ".rodata") && strcmp(section, ".data") && strcmp(section, ".bss")) {
 			printf("line %d in %s does not have valid section name.\n", line_num, argv[1]);
 			printf("[%s]\n", line);
@@ -74,6 +74,12 @@ int main(int argc, char *argv[])
 
 		// Skip GLIBC related data
 		if (strstr(name, "@@GLIBC"))
+			continue;
+
+		if (!strncmp(name, "completed.", 10))
+			continue;
+
+		if (!strncmp(name, "dtor_idx.", 9))
 			continue;
 
 		fprintf(fp2, "%s %lx %x\n", name, addr, size);		

@@ -11,7 +11,7 @@
  *
  *	Programming
  *		started from Jun 3, 2012
- *		last updated on Apr 3, 2013
+ *		last updated on Aug 20, 2013
  *		written by Kim, Wooil
  *		kim844@illinois.edu
  *
@@ -19,8 +19,10 @@
 
 
 #include "pin.H"
-#include "stdio.h"
-#include "string.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
 #include <string>
 #include <map>
 #include <vector>
@@ -34,11 +36,12 @@
 //	Configurable Parameters
 //-------------------------------------------------------------------
 
+//#define __64BIT__
 //	Maximum worker threads are set to 32.
 #define MAX_WORKER	32
 //	Maximum threads are maximum work threads + 1 to support master-workers execution model.
 #define MAX_THREADS MAX_WORKER+1
-#define STATE_BITS	3
+#define STATE_BITS	2
 #define MAX_STATES  (MAX_THREADS)*(STATE_BITS)
 
 #define WORD_BITWIDTH	32
@@ -356,7 +359,7 @@ public:
 		// [TODO] consider word-alignment
 		// Currently, only word-aligned memory allocation is considered.
 		bitset<MAX_STATES>	*pState;
-		int wordSize = (size+3) / 4;
+		int wordSize = (size+ (WORD_SIZE-1)) / WORD_SIZE;
 		pState = new bitset<MAX_STATES> [wordSize];
 		for (int i = 0; i < wordSize; i++)
 			pState[i].reset();
@@ -502,7 +505,7 @@ public:
 			s.append(t);
 		}
 
-		Logger.temp("addVariableName: %s is added as addr 0x%lx.", s.c_str(), prevAddr);
+		Logger.log("addVariableName: %s is added as addr 0x%lx.", s.c_str(), prevAddr);
 		variableNameMap[prevAddr] = s;
 	}
 
@@ -563,7 +566,7 @@ struct GlobalVariableStruct {
 		: name(s), addr(a), size(sz), allocAddr(aa), allocSize(as)
 	{
 		// [TODO] here, I do not consider word alignment.
-		int wordSize = (sz+3) / 4;
+		int wordSize = (sz+ (WORD_BYTES-1)) / WORD_BYTES;
 		pState = new bitset<MAX_STATES> [wordSize];
 		for (int i = 0; i < wordSize; i++)
 			pState[i].reset();
@@ -630,6 +633,13 @@ enum ProgramCategory {
 };
 
 
+enum LockedState {
+	Unlocked,
+	Locked,
+	DuringLockFunc
+};
+
+
 
 //-------------------------------------------------------------------
 //	Global Variables
@@ -665,6 +675,8 @@ INT				MaxThreads;					// Maximum number of threads appeared during execution
 UINT			BarrierCount;				// How many barrier region appeared
 INT				BarrierNumber;				// How many participants for this barrier
 INT				CurrentBarrierArrival;		// For tracking currently arrived participants for the barrier
+INT				SegmentCount[MAX_THREADS];
+
 MallocTracker	MATracker;
 
 std::map<ADDRINT, std::string>	DisAssemblyMap;
@@ -694,7 +706,10 @@ vector<struct GlobalVariableStruct>::iterator	GlobalVariableVecIterator;
 
 //	This is not enough for tracking many lock variables.
 //	For only checking single lock variable, MutexLocked is used.
-BOOL			MutexLocked;
+BOOL			MutexLocked[MAX_THREADS];
+void*			MutexLock[MAX_THREADS];
+BOOL			DuringBarrierFunc[MAX_THREADS];
+BOOL			DuringCondFunc[MAX_THREADS];
 
 //list<ADDRINT>	WrittenWordsInThisLock[MAX_THREADS];
 set<ADDRINT>	WrittenWordsInThisLock[MAX_THREADS];
@@ -711,6 +726,7 @@ void AnalyzeWritebacksAcrossThreads();
 void AnalyzeBarrierRegion(int tid);
 void CheckBarrierResultBefore(THREADID tid);
 void CheckBarrierResultBeforeGOMPImplicit(THREADID tid);
+
 
 
 //	Check if given address is for global variable
@@ -756,7 +772,7 @@ bitset<MAX_STATES>* bitVectorForGlobalVariable(ADDRINT addr)
 		if ((*it).addr == addr)
 			return &((*it).pState[0]);
 		if ( (addr >= (*it).addr) && (addr < (*it).addr + (*it).size) )
-			return &((*it).pState[(addr-(*it).addr) / 4]);
+			return &((*it).pState[(addr-(*it).addr) / WORD_BYTES]);
 	}
 
 	Logger.error("No match in bitVectorForGlobalVariable (end or overrun) addr = 0x%lx", addr);
@@ -954,7 +970,7 @@ VOID* mallocWrapper(CONTEXT *ctxt, AFUNPTR orig_function, THREADID tid, int size
 	if (ret != NULL)
 		MATracker.add((ADDRINT) ret, size);
 	else
-		Logger.warn("[tid: %d] valloc failed.", tid);
+		Logger.warn("[tid: %d] malloc failed.", tid);
 	AfterAlloc[tid] = true;
 	
 	ReleaseLock(&Lock);
@@ -1203,9 +1219,12 @@ void PMC_process(PMCInst function, int tid, ADDRINT addr, int size)
 			}
 			*/
 			// set implementation
-			WrittenWordsInThisEpoch[tid].erase(a);
+			if (MutexLocked[tid])
+				WrittenWordsInThisLock[tid].erase(a);
+			else
+				WrittenWordsInThisEpoch[tid].erase(a);
 			Logger.temp("writeback ends for %x.", a);
-			Logger.log("[tid: %d] writeback ends for word 0x%x.", tid, a);
+			Logger.temp("[tid: %d] writeback ends for word 0x%x.", tid, a);
 			break;
 			//LC[tid].cleanEntry(a);  break;
 
@@ -1289,7 +1308,7 @@ void PMC_process(PMCInst function, int tid, ADDRINT addr, int size)
 		// word alignment should be considered.
 		if (isGlobalVariable(addr)) {
 			ADDRINT	addr2;
-			for (addr2 = addr; addr2 < addr + size; addr2 += 4)
+			for (addr2 = addr; addr2 < addr + size; addr2 += WORD_BYTES)
 			{
 				Logger.temp("[tid: %d] addr2 = %lx", tid, addr2);
 				if (bitVectorForGlobalVariable(addr2) == 0)
@@ -1345,20 +1364,22 @@ void PMC_process(PMCInst function, int tid, ADDRINT addr, int size)
 		else if (MATracker.contain(addr)) {
 			// [TODO] fill this!!!
 			ADDRINT	addr2;
-			for (addr2 = addr; addr2 < addr + size; addr2 += 4)
+			for (addr2 = addr; addr2 < addr + size; addr2 += WORD_BYTES)
 			{
 				for (int i = 0; i < MAX_THREADS; i++)
 				{
-					if ( (* (MATracker.bitVector(addr2)) )[i*2+1] == 1 ) {
+					// currently, for all cases, make other threads' state 'stale'
+					//if ( (* (MATracker.bitVector(addr2)) )[i*2+1] == 1 ) {
 						// 00 means unloaded state
-						// 01 means valid state
-						// 10 means stale state
+						// 01 means read valid state
+						// 10 means write valid state
+						// 11 means stale state
 						(* (MATracker.bitVector(addr2)) )[i*2  ] = 1;
-						(* (MATracker.bitVector(addr2)) )[i*2+1] = 0;
-					}
+						(* (MATracker.bitVector(addr2)) )[i*2+1] = 1;
+					//}
 				}
-				(* (MATracker.bitVector(addr2)) )[tid * 2] = 0;
-				(* (MATracker.bitVector(addr2)) )[tid * 2+1] = 1;
+				(* (MATracker.bitVector(addr2)) )[tid * 2] = 1;
+				(* (MATracker.bitVector(addr2)) )[tid * 2+1] = 0;
 				Logger.temp("[tid: %d] writeback to 0x%lx makes all other threads' state as stale.", tid, addr2);
 			}
 		}
@@ -1369,7 +1390,7 @@ void PMC_process(PMCInst function, int tid, ADDRINT addr, int size)
 		// [TODO] consider size. may need to be included in for loop.
 		if (isGlobalVariable(addr)) {
 			ADDRINT	addr2;
-			for (addr2 = addr; addr2 < addr + size; addr2 += 4)
+			for (addr2 = addr; addr2 < addr + size; addr2 += WORD_BYTES)
 			{
 				(* (bitVectorForGlobalVariable(addr2)) )[tid * 2] = 0;
 				(* (bitVectorForGlobalVariable(addr2)) )[tid * 2+1] = 0;
@@ -1378,7 +1399,7 @@ void PMC_process(PMCInst function, int tid, ADDRINT addr, int size)
 		}
 		else if (MATracker.contain(addr)) {
 			ADDRINT	addr2;
-			for (addr2 = addr; addr2 < addr + size; addr2 += 4)
+			for (addr2 = addr; addr2 < addr + size; addr2 += WORD_BYTES)
 			{
 				(* (MATracker.bitVector(addr2)) )[tid * 2] = 0;
 				(* (MATracker.bitVector(addr2)) )[tid * 2+1] = 0;
@@ -1430,25 +1451,25 @@ VOID inv_range(THREADID tid, VOID *addr, int size)
 VOID wb_word(THREADID tid, VOID *addr)
 {
 	GetLock(&Lock, tid+1);
-	Logger.debug("[tid: %d] wb_word -> addr 0x%p", tid, addr);
+	Logger.log("[tid: %d] wb_word -> addr 0x%p", tid, addr);
 	PMC_process(writeback, tid, (ADDRINT) addr, 4);
 	ReleaseLock(&Lock);
 	return;
 }
 
-VOID wb_long(THREADID tid, VOID *addr)
+VOID wb_dword(THREADID tid, VOID *addr)
 {
 	GetLock(&Lock, tid+1);
-	Logger.debug("[tid: %d] wb_long -> addr 0x%p", tid, addr);
+	Logger.log("[tid: %d] wb_dword -> addr 0x%p", tid, addr);
 	PMC_process(writeback, tid, (ADDRINT) addr, 8);
 	ReleaseLock(&Lock);
 	return;
 }
 
-VOID wb_longlong(THREADID tid, VOID *addr)
+VOID wb_qword(THREADID tid, VOID *addr)
 {
 	GetLock(&Lock, tid+1);
-	Logger.debug("[tid: %d] wb_longlong -> addr 0x%p", tid, addr);
+	Logger.log("[tid: %d] wb_qword -> addr 0x%p", tid, addr);
 	PMC_process(writeback, tid, (ADDRINT) addr, 16);
 	ReleaseLock(&Lock);
 	return;
@@ -1457,7 +1478,7 @@ VOID wb_longlong(THREADID tid, VOID *addr)
 VOID wb_range(THREADID tid, VOID *addr, int size)
 {
 	GetLock(&Lock, tid+1);
-	Logger.debug("[tid: %d] wb_range -> addr 0x%p, size %d 0x%x", tid, addr, size, size);
+	Logger.log("[tid: %d] wb_range -> addr 0x%p, size %d 0x%x", tid, addr, size, size);
 	PMC_process(writeback, tid, (ADDRINT) addr, size);
 	ReleaseLock(&Lock);
 	return;
@@ -1592,6 +1613,7 @@ VOID* barrierInitWrapper(CONTEXT *ctxt, AFUNPTR orig_function, THREADID tid, VOI
 	VOID *ret;
 
 	BarrierNumber = num;
+	DuringBarrierFunc[tid] = true;
 	PIN_CallApplicationFunction(ctxt, PIN_ThreadId(),
 		CALLINGSTD_DEFAULT, orig_function,
 		PIN_PARG(VOID *), &ret,
@@ -1599,6 +1621,7 @@ VOID* barrierInitWrapper(CONTEXT *ctxt, AFUNPTR orig_function, THREADID tid, VOI
 		PIN_PARG(VOID *), some,
 		PIN_PARG(int), num,
 		PIN_PARG_END());
+	DuringBarrierFunc[tid] = false;
 
 	return ret;
 }
@@ -1608,16 +1631,18 @@ VOID* barrierWrapper(CONTEXT *ctxt, AFUNPTR orig_function, THREADID tid, VOID* b
 {
 	VOID *ret;
 
-
+	GetLock(&Lock, tid+1);
 	Logger.log("[tid: %d] Executing barrier wrapper", tid);
 	CheckBarrierResultBefore(tid);
-	
+	DuringBarrierFunc[tid] = true;
+	ReleaseLock(&Lock);
+
 	PIN_CallApplicationFunction(ctxt, PIN_ThreadId(),
 		CALLINGSTD_DEFAULT, orig_function,
 		PIN_PARG(VOID *), &ret, 
 		PIN_PARG(VOID *), bar, 
 		PIN_PARG_END());
-
+	DuringBarrierFunc[tid] = false;
 	return ret;
 }
 
@@ -1666,7 +1691,6 @@ VOID* gompBarrierWrapper(CONTEXT *ctxt, AFUNPTR orig_function, THREADID tid, VOI
 
 
 	//Logger.log("[tid: %d] Executing GOMP barrier wrapper", tid);
-	// temp, windy
 	CheckBarrierResultBefore(tid);
 	
 	PIN_CallApplicationFunction(ctxt, PIN_ThreadId(),
@@ -1699,15 +1723,18 @@ VOID* gomp_fini_work_share_Wrapper(CONTEXT *ctxt, AFUNPTR orig_function, THREADI
 {
 	VOID *ret;
 
-
+	GetLock(&Lock, tid+1);
 	Logger.log("[tid: %d] Executing gomp_fini_work_share wrapper", tid);
 	CheckBarrierResultBeforeGOMPImplicit(tid);
-	
+	DuringBarrierFunc[tid] = true;
+	ReleaseLock(&Lock);
+
 	PIN_CallApplicationFunction(ctxt, PIN_ThreadId(),
 		CALLINGSTD_DEFAULT, orig_function,
 		PIN_PARG(VOID *), &ret, 	// void
 		PIN_PARG(VOID *), bar, 		// struct gomp_work_share *
 		PIN_PARG_END());
+	DuringBarrierFunc[tid] = false;
 
 	return ret;
 }
@@ -1737,8 +1764,11 @@ VOID* lockWrapper(CONTEXT *ctxt, AFUNPTR orig_function, THREADID tid, VOID* mute
 	VOID *ret;
 
 	GetLock(&Lock, tid+1);
-	MutexLocked = true;
-	Logger.log("[tid: %d] Lock", tid);
+	if (MutexLocked[tid] == true) {
+		Logger.warn("[tid: %d] nested lock is detected", tid);
+	}
+	MutexLocked[tid] = DuringLockFunc;
+	ReleaseLock(&Lock);
 
 	PIN_CallApplicationFunction(ctxt, PIN_ThreadId(),
 		CALLINGSTD_DEFAULT, orig_function,
@@ -1746,20 +1776,85 @@ VOID* lockWrapper(CONTEXT *ctxt, AFUNPTR orig_function, THREADID tid, VOID* mute
 		PIN_PARG(VOID *), mutex, 
 		PIN_PARG_END());
 
+	GetLock(&Lock, tid+1);
+	MutexLocked[tid] = Locked;
+	MutexLock[tid] = mutex;
+	Logger.log("[tid: %d] Lock 0x%x", tid, mutex);
 	ReleaseLock(&Lock);
+
 	return ret;
 }
+
+
+void AnalyzeCriticalSection(int tid) 
+{
+	// Report if allocated memory is written but not written back.
+
+	// source code reference for memory allocation is removed.
+	//struct sourceLocation* sl;
+	string s2;
+	vector<struct GlobalVariableStruct>::iterator	it;
+	//list<ADDRINT>::iterator	wit;
+	set<ADDRINT>::iterator	wit;
+
+	Logger.log("[tid: %d] *** Analyzing unwritten-back writes in the critical section", tid);
+	for (wit = WrittenWordsInThisLock[tid].begin(); wit != WrittenWordsInThisLock[tid].end(); wit++)
+	{
+		// check global variable
+		BOOL done = false;
+		for (it = GlobalVariableVec.begin(); it != GlobalVariableVec.end(); it++)
+		{
+			if ( (*wit >= (*it).addr) &&
+				 (*wit < (*it).addr + (*it).size) ) {
+				Logger.warn("0x%lx for %s (offset 0x%lx) is not written back.", *wit, (*it).name.c_str(), (int) (*wit - (*it).addr));
+				done = true;
+				break;
+			}
+		}
+		if (done)
+			continue;
+
+		// check allocated memory
+		s2 = MATracker.getVariableName(*wit);
+		ADDRINT	allocAddr;
+		int	allocSize;
+
+		for (it = GlobalVariableVec.begin(); it != GlobalVariableVec.end(); it++) 
+		{
+			if (s2 == (*it).name) {
+				allocAddr = (*it).allocAddr;
+				allocSize = (*it).allocSize;
+				Logger.warn("0x%lx, allocated in %s (0x%lx, offset 0x%lx, size 0x%lx), is not written back.", *wit,  s2.c_str(), allocAddr, (int) (*wit - allocAddr), allocSize);
+				break;
+			}
+		}
+
+			
+		/*
+		sl = MATracker.getSource(*WrittenWordsIterator[i]);
+		if (sl != NULL) {
+			printf("variable is allocated in col: %d line: %d, filename: %s\n", sl->col, sl->line, sl->filename.c_str());
+		}
+		else
+			Logger.warn("variable source is null\n");
+			//printf("sl is null\n");
+		*/
+	}
+	Logger.log("[tid: %d] *** Analysis for writeback is done.", tid);
+}
+
+
 
 
 VOID* unlockWrapper(CONTEXT *ctxt, AFUNPTR orig_function, THREADID tid, VOID* mutex)
 {
 	VOID *ret;
 
-	GetLock(&Lock, tid+1);
 	// Another checking routine is required.
-	//CheckBarrierResultBefore(tid);
-	MutexLocked = false;
-	Logger.log("[tid: %d] Unlock", tid);
+	//LockBarrierResultBefore(tid);
+	GetLock(&Lock, tid+1);
+	MutexLocked[tid] = DuringLockFunc;
+	ReleaseLock(&Lock);
 
 	PIN_CallApplicationFunction(ctxt, PIN_ThreadId(),
 		CALLINGSTD_DEFAULT, orig_function,
@@ -1767,7 +1862,135 @@ VOID* unlockWrapper(CONTEXT *ctxt, AFUNPTR orig_function, THREADID tid, VOID* mu
 		PIN_PARG(VOID *), mutex, 
 		PIN_PARG_END());
 
+	GetLock(&Lock, tid+1);
+	// Another checking routine is required.
+	//CheckBarrierResultBefore(tid);
+	AnalyzeCriticalSection(tid);
+	WrittenWordsInThisLock[tid].clear();
+	MutexLocked[tid] = Unlocked;
+	MutexLock[tid] = NULL;
+	Logger.log("[tid: %d] Unlock 0x%x, segment %d", tid, SegmentCount[tid]);
+	SegmentCount[tid]++;
 	ReleaseLock(&Lock);
+	return ret;
+}
+
+
+
+
+VOID* condInitWrapper(CONTEXT *ctxt, AFUNPTR orig_function, THREADID tid, VOID* cond, VOID* attr)
+{
+	VOID *ret;
+
+	DuringCondFunc[tid] = true;
+	
+	PIN_CallApplicationFunction(ctxt, PIN_ThreadId(),
+		CALLINGSTD_DEFAULT, orig_function,
+		PIN_PARG(VOID *), &ret, 
+		PIN_PARG(VOID *), cond, 
+		PIN_PARG(VOID *), attr, 
+		PIN_PARG_END());
+
+	DuringCondFunc[tid] = false;
+	return ret;
+}
+
+
+VOID* condWaitWrapper(CONTEXT *ctxt, AFUNPTR orig_function, THREADID tid, VOID* cond, VOID* mutex)
+{
+	VOID *ret;
+
+	GetLock(&Lock, tid+1);
+	Logger.log("[tid: %d] before cond_wait 0x%x", tid, cond);
+	ReleaseLock(&Lock);
+
+	DuringCondFunc[tid] = true;
+	PIN_CallApplicationFunction(ctxt, PIN_ThreadId(),
+		CALLINGSTD_DEFAULT, orig_function,
+		PIN_PARG(VOID *), &ret, 
+		PIN_PARG(VOID *), cond, 
+		PIN_PARG(VOID *), mutex, 
+		PIN_PARG_END());
+
+	GetLock(&Lock, tid+1);
+	DuringCondFunc[tid] = false;
+	Logger.log("[tid: %d] cond_wait 0x%x, segment %d", tid, cond, SegmentCount[tid]);
+	SegmentCount[tid]++;
+	//Ordering.whenWaitIsDone(tid, SegmentCount[tid], cond);
+	ReleaseLock(&Lock);
+
+	return ret;
+}
+
+
+VOID* condWaitNullWrapper(CONTEXT *ctxt, AFUNPTR orig_function, THREADID tid, VOID* cond, VOID* mutex)
+{
+	VOID *ret;
+
+	GetLock(&Lock, tid+1);
+	Logger.log("[tid: %d] before cond_wait_null 0x%x", tid, cond);
+	ReleaseLock(&Lock);
+	DuringCondFunc[tid] = true;
+	PIN_CallApplicationFunction(ctxt, PIN_ThreadId(),
+		CALLINGSTD_DEFAULT, orig_function,
+		PIN_PARG(VOID *), &ret, 
+		PIN_PARG(VOID *), cond, 
+		PIN_PARG(VOID *), mutex, 
+		PIN_PARG_END());
+
+	GetLock(&Lock, tid+1);
+	DuringCondFunc[tid] = false;
+	Logger.log("[tid: %d] cond_wait_null 0x%x, segment %d", tid, cond, SegmentCount[tid]);
+	SegmentCount[tid]++;
+	//Ordering.whenWaitIsDone(tid, SegmentCount[tid], cond);
+	ReleaseLock(&Lock);
+
+	return ret;
+}
+
+
+
+VOID* condSignalWrapper(CONTEXT *ctxt, AFUNPTR orig_function, THREADID tid, VOID* cond)
+{
+	VOID *ret;
+
+	DuringCondFunc[tid] = true;
+	PIN_CallApplicationFunction(ctxt, PIN_ThreadId(),
+		CALLINGSTD_DEFAULT, orig_function,
+		PIN_PARG(VOID *), &ret, 
+		PIN_PARG(VOID *), cond, 
+		PIN_PARG_END());
+
+	GetLock(&Lock, tid+1);
+	DuringCondFunc[tid] = false;
+	Logger.log("[tid: %d] cond_signal 0x%x, segment %d", tid, cond, SegmentCount[tid]);
+	//Ordering.whenSignal(tid, SegmentCount[tid], cond);
+	SegmentCount[tid]++;
+	ReleaseLock(&Lock);
+
+	return ret;
+}
+
+
+VOID* condBroadcastWrapper(CONTEXT *ctxt, AFUNPTR orig_function, THREADID tid, VOID* cond)
+{
+	VOID *ret;
+
+	DuringCondFunc[tid] = true;
+	PIN_CallApplicationFunction(ctxt, PIN_ThreadId(),
+		CALLINGSTD_DEFAULT, orig_function,
+		PIN_PARG(VOID *), &ret, 
+		PIN_PARG(VOID *), cond, 
+		PIN_PARG_END());
+
+	
+	GetLock(&Lock, tid+1);
+	DuringCondFunc[tid] = false;
+	Logger.log("[tid: %d] cond_broadcast 0x%x, segment %d", tid, cond, SegmentCount[tid]);
+	//Ordering.whenSignal(tid, SegmentCount[tid], cond);
+	SegmentCount[tid]++;
+	ReleaseLock(&Lock);
+
 	return ret;
 }
 
@@ -1872,7 +2095,7 @@ VOID ImageLoad(IMG img, VOID *v)
 
 	// wrappers for memory allocation/deallocation functions
 	// valloc in pthread, malloc, calloc, realloc, free
-	rtn = RTN_FindByName(img, "valloc");
+	rtn = RTN_FindByName(img, "valloc_pmc");
 	if (RTN_Valid(rtn)) {
 		PROTO proto = PROTO_Allocate( PIN_PARG(VOID *), CALLINGSTD_DEFAULT,
 						"valloc", PIN_PARG(int), PIN_PARG_END() );
@@ -1900,7 +2123,34 @@ VOID ImageLoad(IMG img, VOID *v)
 			IARG_END);
 	}
 
+	rtn = RTN_FindByName(img, "_Z10malloc_pmcj");
+	if (RTN_Valid(rtn)) {
+		PROTO proto = PROTO_Allocate( PIN_PARG(VOID *), CALLINGSTD_DEFAULT,
+						"malloc_pmc", PIN_PARG(int), PIN_PARG_END() );
+		RTN_ReplaceSignature(rtn, AFUNPTR(mallocWrapper), 
+			IARG_PROTOTYPE, proto,
+			IARG_CONST_CONTEXT,
+			IARG_ORIG_FUNCPTR,
+			IARG_THREAD_ID,
+			IARG_FUNCARG_ENTRYPOINT_VALUE, 0, 
+			IARG_END);
+	}
+
 	rtn = RTN_FindByName(img, "calloc_pmc");
+	if (RTN_Valid(rtn)) {
+		PROTO proto = PROTO_Allocate( PIN_PARG(VOID *), CALLINGSTD_DEFAULT,
+						"calloc_pmc", PIN_PARG(int), PIN_PARG(int), PIN_PARG_END() );
+		RTN_ReplaceSignature(rtn, AFUNPTR(callocWrapper), 
+			IARG_PROTOTYPE, proto,
+			IARG_CONST_CONTEXT,
+			IARG_ORIG_FUNCPTR,
+			IARG_THREAD_ID,
+			IARG_FUNCARG_ENTRYPOINT_VALUE, 0, 
+			IARG_FUNCARG_ENTRYPOINT_VALUE, 1, 
+			IARG_END);
+	}
+
+	rtn = RTN_FindByName(img, "_Z10calloc_pmcjj");
 	if (RTN_Valid(rtn)) {
 		PROTO proto = PROTO_Allocate( PIN_PARG(VOID *), CALLINGSTD_DEFAULT,
 						"calloc_pmc", PIN_PARG(int), PIN_PARG(int), PIN_PARG_END() );
@@ -1928,10 +2178,24 @@ VOID ImageLoad(IMG img, VOID *v)
 			IARG_END);
 	}
 
-	rtn = RTN_FindByName(img, "posix_memalign");
+	rtn = RTN_FindByName(img, "_Z11realloc_pmcPvj");
 	if (RTN_Valid(rtn)) {
 		PROTO proto = PROTO_Allocate( PIN_PARG(VOID *), CALLINGSTD_DEFAULT,
-						"posix_memalign", PIN_PARG(VOID *), PIN_PARG(int), PIN_PARG_END() );
+						"realloc_pmc", PIN_PARG(VOID *), PIN_PARG(int), PIN_PARG_END() );
+		RTN_ReplaceSignature(rtn, AFUNPTR(reallocWrapper), 
+			IARG_PROTOTYPE, proto,
+			IARG_CONST_CONTEXT,
+			IARG_ORIG_FUNCPTR,
+			IARG_THREAD_ID,
+			IARG_FUNCARG_ENTRYPOINT_VALUE, 0, 
+			IARG_FUNCARG_ENTRYPOINT_VALUE, 1, 
+			IARG_END);
+	}
+
+	rtn = RTN_FindByName(img, "posix_memalign_pmc");
+	if (RTN_Valid(rtn)) {
+		PROTO proto = PROTO_Allocate( PIN_PARG(VOID *), CALLINGSTD_DEFAULT,
+						"posix_memalign_pmc", PIN_PARG(VOID *), PIN_PARG(int), PIN_PARG_END() );
 		RTN_ReplaceSignature(rtn, AFUNPTR(reallocWrapper), 
 			IARG_PROTOTYPE, proto,
 			IARG_CONST_CONTEXT,
@@ -1945,6 +2209,19 @@ VOID ImageLoad(IMG img, VOID *v)
 	// more candidates: alloca, _alloca
 
 	rtn = RTN_FindByName(img, "free_pmc");
+	if (RTN_Valid(rtn)) {
+		PROTO proto = PROTO_Allocate( PIN_PARG(VOID *), CALLINGSTD_DEFAULT,
+						"free_pmc", PIN_PARG(VOID *), PIN_PARG_END() );
+		RTN_ReplaceSignature(rtn, AFUNPTR(freeWrapper), 
+			IARG_PROTOTYPE, proto,
+			IARG_CONST_CONTEXT,
+			IARG_ORIG_FUNCPTR,
+			IARG_THREAD_ID,
+			IARG_FUNCARG_ENTRYPOINT_VALUE, 0,
+			IARG_END);
+	}
+
+	rtn = RTN_FindByName(img, "_Z8free_pmcPv");
 	if (RTN_Valid(rtn)) {
 		PROTO proto = PROTO_Allocate( PIN_PARG(VOID *), CALLINGSTD_DEFAULT,
 						"free_pmc", PIN_PARG(VOID *), PIN_PARG_END() );
@@ -1972,7 +2249,30 @@ VOID ImageLoad(IMG img, VOID *v)
 			IARG_END);
 	}
 
+	rtn = RTN_FindByName(img, "_Z8inv_wordPv");
+	if (RTN_Valid(rtn)) {
+		PROTO proto = PROTO_Allocate( PIN_PARG(void), CALLINGSTD_DEFAULT,
+			"inv_word", PIN_PARG(unsigned long), PIN_PARG_END() );
+		//RTN_Replace(rtn, AFUNPTR(inv_word));
+		RTN_ReplaceSignature(rtn, AFUNPTR(inv_word),
+			IARG_PROTOTYPE, proto,
+			IARG_THREAD_ID,
+			IARG_FUNCARG_ENTRYPOINT_VALUE, 0, 
+			IARG_END);
+	}
+
 	rtn = RTN_FindByName(img, "inv_dword");
+	if (RTN_Valid(rtn)) {
+		PROTO proto = PROTO_Allocate( PIN_PARG(void), CALLINGSTD_DEFAULT,
+			"inv_dword", PIN_PARG(unsigned long), PIN_PARG_END() );
+		RTN_ReplaceSignature(rtn, AFUNPTR(inv_dword),
+			IARG_PROTOTYPE, proto,
+			IARG_THREAD_ID,
+			IARG_FUNCARG_ENTRYPOINT_VALUE, 0, 
+			IARG_END);
+	}
+
+	rtn = RTN_FindByName(img, "_Z9inv_dwordPv");
 	if (RTN_Valid(rtn)) {
 		PROTO proto = PROTO_Allocate( PIN_PARG(void), CALLINGSTD_DEFAULT,
 			"inv_dword", PIN_PARG(unsigned long), PIN_PARG_END() );
@@ -1994,6 +2294,18 @@ VOID ImageLoad(IMG img, VOID *v)
 			IARG_END);
 	}
 
+ 	rtn = RTN_FindByName(img, "_Z9inv_qwordPv");
+	if (RTN_Valid(rtn)) {
+		PROTO proto = PROTO_Allocate( PIN_PARG(void), CALLINGSTD_DEFAULT,
+			"inv_qword", PIN_PARG(unsigned long), PIN_PARG_END() );
+		RTN_ReplaceSignature(rtn, AFUNPTR(inv_qword),
+			IARG_PROTOTYPE, proto,
+			IARG_THREAD_ID,
+			IARG_FUNCARG_ENTRYPOINT_VALUE, 0, 
+			IARG_END);
+	}
+
+
 	rtn = RTN_FindByName(img, "inv_range");
 	if (RTN_Valid(rtn)) {
 		PROTO proto = PROTO_Allocate( PIN_PARG(void), CALLINGSTD_DEFAULT,
@@ -2006,8 +2318,32 @@ VOID ImageLoad(IMG img, VOID *v)
 			IARG_END);
 	}
 
+	rtn = RTN_FindByName(img, "_Z9inv_rangePvi");
+	if (RTN_Valid(rtn)) {
+		PROTO proto = PROTO_Allocate( PIN_PARG(void), CALLINGSTD_DEFAULT,
+			"inv_range", PIN_PARG(unsigned long), PIN_PARG(int), PIN_PARG_END() );
+		RTN_ReplaceSignature(rtn, AFUNPTR(inv_range),
+			IARG_PROTOTYPE, proto,
+			IARG_THREAD_ID,
+			IARG_FUNCARG_ENTRYPOINT_VALUE, 0, 
+			IARG_FUNCARG_ENTRYPOINT_VALUE, 1, 
+			IARG_END);
+	}
+
+
 	// Writeback
 	rtn = RTN_FindByName(img, "wb_word");
+	if (RTN_Valid(rtn)) {
+		PROTO proto = PROTO_Allocate( PIN_PARG(void), CALLINGSTD_DEFAULT,
+			"wb_word", PIN_PARG(unsigned long), PIN_PARG_END() );
+		RTN_ReplaceSignature(rtn, AFUNPTR(wb_word),
+			IARG_PROTOTYPE, proto,
+			IARG_THREAD_ID,
+			IARG_FUNCARG_ENTRYPOINT_VALUE, 0, 
+			IARG_END);
+	}
+
+	rtn = RTN_FindByName(img, "_Z7wb_wordPv");
 	if (RTN_Valid(rtn)) {
 		PROTO proto = PROTO_Allocate( PIN_PARG(void), CALLINGSTD_DEFAULT,
 			"wb_word", PIN_PARG(unsigned long), PIN_PARG_END() );
@@ -2022,7 +2358,18 @@ VOID ImageLoad(IMG img, VOID *v)
 	if (RTN_Valid(rtn)) {
 		PROTO proto = PROTO_Allocate( PIN_PARG(void), CALLINGSTD_DEFAULT,
 			"wb_dword", PIN_PARG(unsigned long), PIN_PARG_END() );
-		RTN_ReplaceSignature(rtn, AFUNPTR(wb_long),
+		RTN_ReplaceSignature(rtn, AFUNPTR(wb_dword),
+			IARG_PROTOTYPE, proto,
+			IARG_THREAD_ID,
+			IARG_FUNCARG_ENTRYPOINT_VALUE, 0, 
+			IARG_END);
+	}
+
+	rtn = RTN_FindByName(img, "_Z8wb_dwordPv");
+	if (RTN_Valid(rtn)) {
+		PROTO proto = PROTO_Allocate( PIN_PARG(void), CALLINGSTD_DEFAULT,
+			"wb_dword", PIN_PARG(unsigned long), PIN_PARG_END() );
+		RTN_ReplaceSignature(rtn, AFUNPTR(wb_dword),
 			IARG_PROTOTYPE, proto,
 			IARG_THREAD_ID,
 			IARG_FUNCARG_ENTRYPOINT_VALUE, 0, 
@@ -2033,7 +2380,18 @@ VOID ImageLoad(IMG img, VOID *v)
 	if (RTN_Valid(rtn)) {
 		PROTO proto = PROTO_Allocate( PIN_PARG(void), CALLINGSTD_DEFAULT,
 			"wb_qword", PIN_PARG(unsigned long), PIN_PARG_END() );
-		RTN_ReplaceSignature(rtn, AFUNPTR(wb_longlong),
+		RTN_ReplaceSignature(rtn, AFUNPTR(wb_qword),
+			IARG_PROTOTYPE, proto,
+			IARG_THREAD_ID,
+			IARG_FUNCARG_ENTRYPOINT_VALUE, 0, 
+			IARG_END);
+	}
+
+	rtn = RTN_FindByName(img, "_Z8wb_qwordPv");
+	if (RTN_Valid(rtn)) {
+		PROTO proto = PROTO_Allocate( PIN_PARG(void), CALLINGSTD_DEFAULT,
+			"wb_qword", PIN_PARG(unsigned long), PIN_PARG_END() );
+		RTN_ReplaceSignature(rtn, AFUNPTR(wb_qword),
 			IARG_PROTOTYPE, proto,
 			IARG_THREAD_ID,
 			IARG_FUNCARG_ENTRYPOINT_VALUE, 0, 
@@ -2041,6 +2399,18 @@ VOID ImageLoad(IMG img, VOID *v)
 	}
 
 	rtn = RTN_FindByName(img, "wb_range");
+	if (RTN_Valid(rtn)) {
+		PROTO proto = PROTO_Allocate( PIN_PARG(void), CALLINGSTD_DEFAULT,
+			"wb_range", PIN_PARG(unsigned long), PIN_PARG(int), PIN_PARG_END() );
+		RTN_ReplaceSignature(rtn, AFUNPTR(wb_range),
+			IARG_PROTOTYPE, proto,
+			IARG_THREAD_ID,
+			IARG_FUNCARG_ENTRYPOINT_VALUE, 0, 
+			IARG_FUNCARG_ENTRYPOINT_VALUE, 1, 
+			IARG_END);
+	}
+
+	rtn = RTN_FindByName(img, "_Z8wb_rangePvi");
 	if (RTN_Valid(rtn)) {
 		PROTO proto = PROTO_Allocate( PIN_PARG(void), CALLINGSTD_DEFAULT,
 			"wb_range", PIN_PARG(unsigned long), PIN_PARG(int), PIN_PARG_END() );
@@ -2238,7 +2608,6 @@ VOID ImageLoad(IMG img, VOID *v)
 		}
 		*/
 
-		/*
 		// pthread_mutex_lock
 		rtn = RTN_FindByName(img, "pthread_mutex_lock");
 		if (RTN_Valid(rtn)) {
@@ -2270,7 +2639,104 @@ VOID ImageLoad(IMG img, VOID *v)
 				//IARG_FUNCARG_ENTRYPOINT_VALUE, 2,
 				IARG_END);
 		}
-		*/
+
+
+		// pthread_cond_init
+		rtn = RTN_FindByName(img, "pthread_cond_init");
+		if (RTN_Valid(rtn)) {
+			PROTO proto = PROTO_Allocate( PIN_PARG(VOID *), CALLINGSTD_DEFAULT,
+							"pthread_cond_init", PIN_PARG(VOID *), PIN_PARG(VOID *), PIN_PARG_END() );
+			RTN_ReplaceSignature(rtn, AFUNPTR(condInitWrapper),
+				IARG_PROTOTYPE, proto,
+				IARG_CONST_CONTEXT,
+				IARG_ORIG_FUNCPTR,
+				IARG_THREAD_ID,
+				IARG_FUNCARG_ENTRYPOINT_VALUE, 0,
+				IARG_FUNCARG_ENTRYPOINT_VALUE, 1,
+				//IARG_FUNCARG_ENTRYPOINT_VALUE, 2,
+				IARG_END);
+		}
+			
+		// pthread_cond_wait
+		rtn = RTN_FindByName(img, "pthread_cond_wait");
+		if (RTN_Valid(rtn)) {
+			PROTO proto = PROTO_Allocate( PIN_PARG(VOID *), CALLINGSTD_DEFAULT,
+							"pthread_cond_wait", PIN_PARG(VOID *), PIN_PARG(VOID *), PIN_PARG_END() );
+			RTN_ReplaceSignature(rtn, AFUNPTR(condWaitWrapper),
+				IARG_PROTOTYPE, proto,
+				IARG_CONST_CONTEXT,
+				IARG_ORIG_FUNCPTR,
+				IARG_THREAD_ID,
+				IARG_FUNCARG_ENTRYPOINT_VALUE, 0,
+				IARG_FUNCARG_ENTRYPOINT_VALUE, 1,
+				//IARG_FUNCARG_ENTRYPOINT_VALUE, 2,
+				IARG_END);
+		}
+
+		// pthread_cond_wait_null
+		rtn = RTN_FindByName(img, "pthread_cond_wait_null");
+		if (RTN_Valid(rtn)) {
+			PROTO proto = PROTO_Allocate( PIN_PARG(VOID *), CALLINGSTD_DEFAULT,
+							"pthread_cond_wait_null", PIN_PARG(VOID *), PIN_PARG(VOID *), PIN_PARG_END() );
+			RTN_ReplaceSignature(rtn, AFUNPTR(condWaitNullWrapper),
+				IARG_PROTOTYPE, proto,
+				IARG_CONST_CONTEXT,
+				IARG_ORIG_FUNCPTR,
+				IARG_THREAD_ID,
+				IARG_FUNCARG_ENTRYPOINT_VALUE, 0,
+				IARG_FUNCARG_ENTRYPOINT_VALUE, 1,
+				//IARG_FUNCARG_ENTRYPOINT_VALUE, 2,
+				IARG_END);
+		}
+
+
+		// pthread_cond_wait_null
+		rtn = RTN_FindByName(img, "_Z22pthread_cond_wait_nullPvS_");
+		if (RTN_Valid(rtn)) {
+			PROTO proto = PROTO_Allocate( PIN_PARG(VOID *), CALLINGSTD_DEFAULT,
+							"pthread_cond_wait_null", PIN_PARG(VOID *), PIN_PARG(VOID *), PIN_PARG_END() );
+			RTN_ReplaceSignature(rtn, AFUNPTR(condWaitNullWrapper),
+				IARG_PROTOTYPE, proto,
+				IARG_CONST_CONTEXT,
+				IARG_ORIG_FUNCPTR,
+				IARG_THREAD_ID,
+				IARG_FUNCARG_ENTRYPOINT_VALUE, 0,
+				IARG_FUNCARG_ENTRYPOINT_VALUE, 1,
+				//IARG_FUNCARG_ENTRYPOINT_VALUE, 2,
+				IARG_END);
+		}
+
+		// pthread_cond_signal
+		rtn = RTN_FindByName(img, "pthread_cond_signal");
+		if (RTN_Valid(rtn)) {
+			PROTO proto = PROTO_Allocate( PIN_PARG(VOID *), CALLINGSTD_DEFAULT,
+							"pthread_cond_signal", PIN_PARG(VOID *), PIN_PARG_END() );
+			RTN_ReplaceSignature(rtn, AFUNPTR(condSignalWrapper),
+				IARG_PROTOTYPE, proto,
+				IARG_CONST_CONTEXT,
+				IARG_ORIG_FUNCPTR,
+				IARG_THREAD_ID,
+				IARG_FUNCARG_ENTRYPOINT_VALUE, 0,
+				//IARG_FUNCARG_ENTRYPOINT_VALUE, 2,
+				IARG_END);
+		}
+			
+		// pthread_cond_broadcat
+		rtn = RTN_FindByName(img, "pthread_cond_broadcast");
+		if (RTN_Valid(rtn)) {
+			PROTO proto = PROTO_Allocate( PIN_PARG(VOID *), CALLINGSTD_DEFAULT,
+							"pthread_cond_broadcast", PIN_PARG(VOID *), PIN_PARG_END() );
+			RTN_ReplaceSignature(rtn, AFUNPTR(condBroadcastWrapper),
+				IARG_PROTOTYPE, proto,
+				IARG_CONST_CONTEXT,
+				IARG_ORIG_FUNCPTR,
+				IARG_THREAD_ID,
+				IARG_FUNCARG_ENTRYPOINT_VALUE, 0,
+				//IARG_FUNCARG_ENTRYPOINT_VALUE, 2,
+				IARG_END);
+		}
+
+
 	}
 	else if (Category == OPENMP) {
 
@@ -2287,7 +2753,6 @@ VOID ImageLoad(IMG img, VOID *v)
 				IARG_FUNCARG_ENTRYPOINT_VALUE, 0,
 				IARG_END);
 		}
-
 
 
 		// GOMP_barrier for OpenMP
@@ -2380,14 +2845,14 @@ void AnalyzeBarrierRegion(int tid)
 
 		// check allocated memory
 		s2 = MATracker.getVariableName(*wit);
-		ADDRINT	allocAddr = 0;
-		int		allocSize = 0;
+		ADDRINT	allocAddr;
+		//int		allocSize;
 
 		for (it = GlobalVariableVec.begin(); it != GlobalVariableVec.end(); it++) 
 		{
 			if (s2 == (*it).name) {
 				allocAddr = (*it).allocAddr;
-				allocSize = (*it).allocSize;
+				//allocSize = (*it).allocSize;
 				Logger.warn("0x%lx, allocated in %s (0x%lx, offset x0%x %d), is not written back.", *wit,  s2.c_str(), allocAddr, (int) (*wit - allocAddr), (int) (*wit - allocAddr));
 				break;
 			}
@@ -2483,7 +2948,7 @@ void CheckBarrierResult(THREADID tid, int ret)
 void CheckBarrierResultBefore(THREADID tid)
 {
 	// temp, windy
-	GetLock(&Lock, tid+1);
+	//GetLock(&Lock, tid+1);
 	Logger.log("[tid: %d] reached to barrier %d", tid, BarrierCount);
 
 	// phase proceeding in each thread
@@ -2507,7 +2972,7 @@ void CheckBarrierResultBefore(THREADID tid)
 	}
 
 	// temp, windy
-	ReleaseLock(&Lock);
+	//ReleaseLock(&Lock);
 }
 
 void CheckBarrierResultBeforeGOMPImplicit(THREADID tid)
@@ -2561,14 +3026,14 @@ void VallocAfter(THREADID tid, int ret)
 
 void lockWrapperBefore(THREADID tid)
 {
-	MutexLocked = true;
+	MutexLocked[tid] = true;
 	Logger.log("[tid: %d] Lock", tid);
 }
 
 
 void unlockWrapperBefore(THREADID tid)
 {
-	MutexLocked = false;
+	MutexLocked[tid] = false;
 	Logger.log("[tid: %d] Unlock", tid);
 }
 
@@ -2651,12 +3116,21 @@ VOID Routine(RTN rtn, VOID *v)
 
 VOID ReadsMemBefore (ADDRINT applicationIp, THREADID tid, ADDRINT memoryAddressRead, UINT32 memoryReadSize)
 {
-	ADDRINT startWordAddress, endWordAddress, startOffset;
-	ADDRINT offsetMask = 0x3;
+	ADDRINT startWordAddress;
+	//, endWordAddress, startOffset;
+	//ADDRINT offsetMask = 0x3;
 
 	// Before main running, we do not track read/write access.
 	if (!MainRunning)
 		return;
+
+	if (DuringBarrierFunc[tid] == true)
+		return;
+	if (DuringCondFunc[tid] == true)
+		return;
+	if (MutexLocked[tid] == DuringLockFunc)
+		return;
+
 
 	GetLock(&Lock, tid+1);
 	// if read is from allocated memory
@@ -2668,17 +3142,17 @@ VOID ReadsMemBefore (ADDRINT applicationIp, THREADID tid, ADDRINT memoryAddressR
 		NumReads[tid].count++;
 		//ReleaseLock(&Lock);
 
-		if (MutexLocked)
+		if (MutexLocked[tid])
 			Logger.temp("[tid: %d] epoch: %d Locked / Read address = 0x%lx", tid, BarrierCount, memoryAddressRead);
 		else
 			Logger.temp("[tid: %d] epoch: %d Read address = 0x%lx", tid, BarrierCount, memoryAddressRead);
 
 
 		startWordAddress = memoryAddressRead & ADDR_MASK;
-		endWordAddress = (memoryAddressRead + memoryReadSize) & ADDR_MASK;
-		startOffset = memoryAddressRead & offsetMask;
+		//endWordAddress = (memoryAddressRead + memoryReadSize) & ADDR_MASK;
+		//startOffset = memoryAddressRead & offsetMask;
 
-		for (ADDRINT a = startWordAddress; a < memoryAddressRead + memoryReadSize; a += 4)
+		for (ADDRINT a = startWordAddress; a < memoryAddressRead + memoryReadSize; a += WORD_BYTES)
 		{
 			// invalidation test
 			if ( (* (MATracker.bitVector(a)) )[tid*2] == 1) {
@@ -2703,17 +3177,17 @@ VOID ReadsMemBefore (ADDRINT applicationIp, THREADID tid, ADDRINT memoryAddressR
 		NumReads[tid].count++;
 		//ReleaseLock(&Lock);
 
-		if (MutexLocked)
+		if (MutexLocked[tid])
 			Logger.temp("[tid: %d] epoch: %d Locked / Read address = 0x%lx", tid, BarrierCount, memoryAddressRead);
 		else
 			Logger.temp("[tid: %d] epoch: %d Read address = 0x%lx", tid, BarrierCount, memoryAddressRead);
 
 
 		startWordAddress = memoryAddressRead & ADDR_MASK;
-		endWordAddress = (memoryAddressRead + memoryReadSize) & ADDR_MASK;
-		startOffset = memoryAddressRead & offsetMask;
+		//endWordAddress = (memoryAddressRead + memoryReadSize) & ADDR_MASK;
+		//startOffset = memoryAddressRead & offsetMask;
 
-		for (ADDRINT a = startWordAddress; a < memoryAddressRead + memoryReadSize; a += 4)
+		for (ADDRINT a = startWordAddress; a < memoryAddressRead + memoryReadSize; a += WORD_BYTES)
 		{
 				//	Logger.warn("[tid: %d] read : %s, %lx", tid, getGlobalVariableName(a), a);
 			// invalidation test
@@ -2736,12 +3210,22 @@ VOID ReadsMemBefore (ADDRINT applicationIp, THREADID tid, ADDRINT memoryAddressR
 
 VOID WritesMemBefore(ADDRINT applicationIp, THREADID tid, ADDRINT memoryAddressWrite, UINT32 memoryWriteSize)
 {
-	ADDRINT startWordAddress, endWordAddress, startOffset;
-	ADDRINT offsetMask = 0x3;
+	ADDRINT startWordAddress;
+	//, endWordAddress, startOffset;
+	//ADDRINT offsetMask = 0x3;
 
 	// Before main running, we do not track read/write access.
 	if (!MainRunning)
 		return;
+
+	// During pthread synchronization functions, we disable read/write tracking.
+	if (DuringBarrierFunc[tid] == true)
+		return;
+	if (DuringCondFunc[tid] == true)
+		return;
+	if (MutexLocked[tid] == DuringLockFunc)
+		return;
+
 
 	GetLock(&Lock, tid+1);
 	// For memory-allocated address, written words should be recorded.
@@ -2753,11 +3237,10 @@ VOID WritesMemBefore(ADDRINT applicationIp, THREADID tid, ADDRINT memoryAddressW
 		NumWrites[tid].count++;
 		//ReleaseLock(&Lock);
 
-
 		Logger.temp("[tid: %d] epoch: %d Write address = 0x%lx",
 			tid, BarrierCount, memoryAddressWrite);
 
-		if (MutexLocked)
+		if (MutexLocked[tid])
 			Logger.temp("[tid: %d] epoch: %d Locked / Write address = 0x%lx to %s",
 				tid, BarrierCount, memoryAddressWrite, MATracker.getVariableName(memoryAddressWrite).c_str());
 		else
@@ -2765,12 +3248,12 @@ VOID WritesMemBefore(ADDRINT applicationIp, THREADID tid, ADDRINT memoryAddressW
 				tid, BarrierCount, memoryAddressWrite, MATracker.getVariableName(memoryAddressWrite).c_str());
 
 		startWordAddress = memoryAddressWrite & ADDR_MASK;
-		endWordAddress = (memoryAddressWrite + memoryWriteSize) & ADDR_MASK;
-		startOffset = memoryAddressWrite & offsetMask;
+		//endWordAddress = (memoryAddressWrite + memoryWriteSize) & ADDR_MASK;
+		//startOffset = memoryAddressWrite & offsetMask;
 
-		for (ADDRINT a = startWordAddress; a < memoryAddressWrite + memoryWriteSize; a += 4)
+		for (ADDRINT a = startWordAddress; a < memoryAddressWrite + memoryWriteSize; a += WORD_BYTES)
 		{
-			if (MutexLocked) {
+			if (MutexLocked[tid]) {
 				// add this word to written words group
 				/*
 				for (WrittenWordsIterator[tid] = WrittenWordsInThisLock[tid].begin(); WrittenWordsIterator[tid] != WrittenWordsInThisLock[tid].end(); WrittenWordsIterator[tid]++)
@@ -2839,7 +3322,7 @@ VOID WritesMemBefore(ADDRINT applicationIp, THREADID tid, ADDRINT memoryAddressW
 		//ReleaseLock(&Lock);
 
 
-		if (MutexLocked)
+		if (MutexLocked[tid])
 			Logger.temp("[tid: %d] epoch: %d Locked / Write address = 0x%lx to %s",
 				tid, BarrierCount, memoryAddressWrite, getGlobalVariableName(memoryAddressWrite));
 		else
@@ -2847,12 +3330,12 @@ VOID WritesMemBefore(ADDRINT applicationIp, THREADID tid, ADDRINT memoryAddressW
 				tid, BarrierCount, memoryAddressWrite, getGlobalVariableName(memoryAddressWrite));
 
 		startWordAddress = memoryAddressWrite & ADDR_MASK;
-		endWordAddress = (memoryAddressWrite + memoryWriteSize) & ADDR_MASK;
-		startOffset = memoryAddressWrite & offsetMask;
+		//endWordAddress = (memoryAddressWrite + memoryWriteSize) & ADDR_MASK;
+		//startOffset = memoryAddressWrite & offsetMask;
 
-		for (ADDRINT a = startWordAddress; a < memoryAddressWrite + memoryWriteSize; a += 4)
+		for (ADDRINT a = startWordAddress; a < memoryAddressWrite + memoryWriteSize; a += WORD_BYTES)
 		{
-			if (MutexLocked) {
+			if (MutexLocked[tid]) {
 				/*
 				for (WrittenWordsIterator[tid] = WrittenWordsInThisLock[tid].begin(); WrittenWordsIterator[tid] != WrittenWordsInThisEpoch[tid].end(); WrittenWordsIterator[tid]++)
 				{
@@ -2914,7 +3397,11 @@ VOID WritesMemBefore(ADDRINT applicationIp, THREADID tid, ADDRINT memoryAddressW
 		// Currently checking if this instruction is for malloc statement is ugly.
 		// [TODO] Find the better way without string comparison
 		// printf("%s\n", DisAssemblyMap[applicationIp].c_str());
-		if (strstr(DisAssemblyMap[applicationIp].c_str(), "rax")) {
+			#ifdef __64BIT__
+			if (strstr(DisAssemblyMap[applicationIp].c_str(), "rax")) {
+			#else
+			if (strstr(DisAssemblyMap[applicationIp].c_str(), "eax")) {
+			#endif
 			// Source code tracing
 			INT32	col, line;
 			string	filename;
@@ -3055,8 +3542,8 @@ VOID ThreadFini(THREADID tid, const CONTEXT *ctxt, INT32 flags, VOID *V)
 
 	NumThreads--;
 
-	AnalyzeBarrierRegion(0);
-	WrittenWordsInThisEpoch[0].clear();
+	AnalyzeBarrierRegion(tid);
+	WrittenWordsInThisEpoch[tid].clear();
 
 	if (NumThreads == 1) {
 		// temp, windy
@@ -3112,19 +3599,19 @@ VOID FinalAnalysis()
 
 			// check allocated memory
 			s2 = MATracker.getVariableName(*wit);
-			ADDRINT	allocAddr = 0;
-			int		allocSize = 0;
+			ADDRINT	allocAddr;
+			//int		allocSize;
 
 			for (it = GlobalVariableVec.begin(); it != GlobalVariableVec.end(); it++) 
 			{
 				if (s2 == (*it).name) {
 					allocAddr = (*it).allocAddr;
-					allocSize = (*it).allocSize;
+					//allocSize = (*it).allocSize;
+					Logger.log("0x%lx, allocated in %s (0x%lx, offset 0x%x %d), is not written back.\n", *wit,  s2.c_str(), allocAddr, (int) (*wit - allocAddr), (int) (*wit - allocAddr));
 					break;
 				}
 			}
 
-			Logger.log("0x%lx, allocated in %s (0x%lx, offset 0x%x %d), is not written back.\n", *wit,  s2.c_str(), allocAddr, (int) (*wit - allocAddr), (int) (*wit - allocAddr));
 			
 			/*
 			sl = MATracker.getSource(*WrittenWordsIterator[i]);
@@ -3186,7 +3673,11 @@ VOID ReadVariableInfo(char *filename)
 		return ;
 	}
 	while ( fgets(line, 100, fp) != NULL) {
+		#ifdef __64BIT__
 		sscanf(line, "%s %lx %x", id, &addr, &size);
+		#else
+		sscanf(line, "%s %x %x", id, &addr, &size);
+		#endif
 		if (ExcludePotentialSystemVariables) {
 			if ((id[0] == '.') || (id[0] == '_'))
 				continue;
@@ -3421,6 +3912,7 @@ int main(int argc, char * argv[])
 	for (int i = 0; i < MAX_THREADS; i++) {
 		NumReads[i].count = NumWrites[i].count = 0;
 		AfterAlloc[i] = false;
+		SegmentCount[i] = 0;
 	}
 
 	ReadVariableInfo(VariableFileName);
