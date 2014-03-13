@@ -523,6 +523,47 @@ public:
 		return -1;
 	}
 
+
+	map<ADDRINT, int>::iterator containIterator(ADDRINT addr, int size)
+	{
+		pair < map<ADDRINT, int>::iterator, bool> insertResult;
+		insertResult = addrMap.insert(make_pair(addr, size));
+
+		if (insertResult.second == true) {
+			// inserted, meaning no address was in the map
+			// either no heap address or address in the allocated range
+			it = insertResult.first;
+
+			if (it != addrMap.begin()) {
+				// *it is not the first
+				ADDRINT		startAddr, endAddr;
+
+				it--;
+				startAddr = it->first;
+				endAddr = startAddr + it->second;
+
+				if (endAddr > addr) {	// within the allocated range
+					addrMap.erase(insertResult.first);
+					return it;
+				}
+				else {	// not within the allocated range
+					addrMap.erase(insertResult.first);
+					return addrMap.end();
+				}
+			}
+			else {
+				// *it is the first.
+				addrMap.erase(insertResult.first);
+				return addrMap.end();
+			}
+		}
+		else {
+			// already there. the first address of one allocated range.
+			return insertResult.first;
+		}
+	}
+
+
 	// to provide an offset inside the variable for the given address
 	// It is recommended to call getBase with real address which passes contain().
 	ADDRINT getBase(ADDRINT addr)
@@ -540,6 +581,20 @@ public:
 			}
 			else
 				return -1;
+		}
+		return -1;
+	}
+
+
+	ADDRINT getBaseIndex(ADDRINT addr, INT32 index)
+	{
+		ADDRINT startAddr, endAddr;
+		startAddr = addrVec[index].first;
+		endAddr = startAddr + addrVec[index].second;
+
+		if (startAddr <= addr) {
+			if (endAddr > addr)
+				return startAddr;
 		}
 		return -1;
 	}
@@ -574,7 +629,7 @@ public:
 
 		if (startAddr <= addr) {
 			if (endAddr > addr)
-				return addr = startAddr;
+				return addr - startAddr;
 		}
 		return -1;
 	}
@@ -732,6 +787,14 @@ public:
 		
 		return variableNameMap[startAddr];		
 	}
+
+	string getVariableNameIndex(INT32 index)
+	{
+		ADDRINT startAddr;
+		startAddr = addrVec[index].first;
+		return variableNameMap[startAddr];		
+	}
+
 };	// class MallocTracker
 
 
@@ -4572,12 +4635,14 @@ VOID ReadsMemBefore (ADDRINT applicationIp, THREADID tid, ADDRINT memoryAddressR
 
 	//Logger.ext_debug("Global 0x6064a0 %d %d", (* (bitVectorForGlobalVariable(0x6064a0)) )[tid*2], (* (bitVectorForGlobalVariable(0x6064a0)) )[tid*2+1]);
 
-	return ;
-
-	GetLock(&Lock, tid+1);
+	
+	//GetLock(&Lock, tid+1);
 	//Logger.ext_debug("check %s", (bitVectorForGlobalVariable(0x6064a0))->to_string().c_str());
 	// if read is from allocated memory
-	if (MATracker.contain(memoryAddressRead)) {
+	//if (MATracker.contain(memoryAddressRead)) {
+	INT32	index;
+	index = MATracker.containIndex(memoryAddressRead);
+	if (index >= 0) {
 		// File trace is disabled for now.
 		//GetLock(&Lock, tid+1);
 		//fprintf(Trace, "[tid: %d] %d Read address = 0x%lx\n", tid, BarrierCount, memoryAddressRead);
@@ -4603,6 +4668,74 @@ VOID ReadsMemBefore (ADDRINT applicationIp, THREADID tid, ADDRINT memoryAddressR
 			// i) missing writeback from others in previous epoch
 			// ii) failure to analyze OCC
 
+			bitset<MAX_STATES>* bv;
+			bv = MATracker.bitVectorIndex(a, index);
+
+			for (UINT32 j = 0; j < MAX_THREADS; j++)
+			{
+				if (j == tid) continue;
+				if ( (* bv )[j*2  ] == 1 &&
+					 (* bv )[j*2+1] == 0 ) {
+					int col, line;
+					string filename;
+
+					if (SrcReadTracking) {
+						PIN_LockClient();
+						PIN_GetSourceLocation(applicationIp, &col, &line, &filename);
+						PIN_UnlockClient();
+					}
+
+					// previously error, but this is not an error.
+					// guess this is set as an error for checking functionality.
+					GetLock(&Lock, tid+1);
+					Logger.error("[tid: %d] thread %d has dirty copy, but current thread tries to read with auto invalidation for address 0x%lx, name %s, base=0x%lx, offset=0x%x at line %d file %s",
+						tid, j, a, MATracker.getVariableNameIndex(index).c_str(), MATracker.getBaseIndex(a, index), MATracker.getOffsetIndex(a, index), line, filename.c_str());
+					ReleaseLock(&Lock);
+				}						
+			}
+
+			// invalidation test
+			if ( (*bv )[tid*2] == 1) {
+				if ( (* bv )[tid*2+1] == 1) {
+					if ( ((MutexLocked[tid] == Locked) && AutoInvForLock[tid]) ||
+						 ((MutexLocked[tid] == Unlocked) && AutoInvForEpoch[tid]) ) {
+					//if (AutoInvForLock[tid] || AutoInvForEpoch[tid]) {
+						// making it read valid with auto invalidation
+						GetLock(&Lock, tid+1);
+						(* bv )[tid*2  ] = 0;
+						(* bv )[tid*2+1] = 1;
+						Logger.log("[tid: %d] auto invalidated for address 0x%lx, name:%s, base=0x%lx offset=0x%x", 
+							tid, a, MATracker.getVariableNameIndex(index).c_str(), MATracker.getBaseIndex(a, index), MATracker.getOffsetIndex(a, index));
+						ReleaseLock(&Lock);
+						continue;
+					}
+
+					// Source code tracing
+					INT32	col, line;
+					string	filename;
+					// for allocation code
+					//struct sourceLocation *s;
+					//s = MATracker.getSource(a);
+					if (SrcReadTracking) {
+						PIN_LockClient();
+						PIN_GetSourceLocation(applicationIp, &col, &line, &filename);
+						PIN_UnlockClient();
+					}
+
+					// means 'need invalidation'
+					GetLock(&Lock, tid+1);
+					Logger.error("[tid: %d] read without invalidation: addr=0x%lx, %s (offset %ld 0x%lx), read at line %d file %s", tid, a, MATracker.getVariableNameIndex(index).c_str(), MATracker.getOffsetIndex(a, index), MATracker.getOffsetIndex(a, index), line, filename.c_str());
+					ReleaseLock(&Lock);
+				}
+				// '10' means write valid. So, no action.
+			}
+			else if ( (* bv )[tid*2+1] == 0) {
+				// means currently invalid state, 00
+				Logger.ext_debug("read at unloaded state");
+				(* bv )[tid*2+1] = 1;	// changed to read valid state
+			}
+	
+			/*
 			for (UINT32 j = 0; j < MAX_THREADS; j++)
 			{
 				if (j == tid) continue;
@@ -4660,6 +4793,7 @@ VOID ReadsMemBefore (ADDRINT applicationIp, THREADID tid, ADDRINT memoryAddressR
 				Logger.ext_debug("read at unloaded state");
 				(* (MATracker.bitVector(a)) )[tid*2+1] = 1;	// changed to read valid state
 			}
+			*/
 		}
 	}
 	// else if read is from global memory
@@ -4705,8 +4839,10 @@ VOID ReadsMemBefore (ADDRINT applicationIp, THREADID tid, ADDRINT memoryAddressR
 
 					// previously error, but this is not an error.
 					// guess this is set as an error for checking functionality.
+					GetLock(&Lock, tid+1);
 					Logger.error("[tid: %d] thread %d has dirty copy, but current thread tries to read with auto invalidation for address 0x%lx, name %s, base=0x%lx, offset=0x%x at line %d file %s",
 						tid, j, a, getGlobalVariableName(a), baseInGlobalVariable(a), offsetInGlobalVariable(a), line, filename.c_str());
+					ReleaseLock(&Lock);
 				}						
 			}
 
@@ -4718,10 +4854,12 @@ VOID ReadsMemBefore (ADDRINT applicationIp, THREADID tid, ADDRINT memoryAddressR
 						 ((MutexLocked[tid] == Unlocked) && AutoInvForEpoch[tid]) ) {
 					//if (AutoInvForLock[tid] || AutoInvForEpoch[tid]) {
 						// making it read valid with auto invalidation
+						GetLock(&Lock, tid+1);
 						(* (bitVectorForGlobalVariable(a)) )[tid*2  ] = 0;
 						(* (bitVectorForGlobalVariable(a)) )[tid*2+1] = 1;
 						Logger.log("[tid: %d] auto invalidated for address 0x%lx, allocated to name:%s, base=0x%lx offset=0x%x", 
 							tid, a, getGlobalVariableName(a), baseInGlobalVariable(a), offsetInGlobalVariable(a));
+						ReleaseLock(&Lock);
 						continue;
 					}
 
@@ -4735,7 +4873,9 @@ VOID ReadsMemBefore (ADDRINT applicationIp, THREADID tid, ADDRINT memoryAddressR
 					}
 
 					// means 'need invalidation'
+					GetLock(&Lock, tid+1);
 					Logger.error("[tid: %d] read without invalidation: addr=0x%lx, %s (offset %ld 0x%lx), read at line %d file %s", tid, a, getGlobalVariableName(a), offsetInGlobalVariable(a), offsetInGlobalVariable(a), line, filename.c_str());
+					ReleaseLock(&Lock);
 				}
 			}
 			else if ( (* (bitVectorForGlobalVariable(a)) )[tid*2+1] == 0) {
@@ -4745,7 +4885,7 @@ VOID ReadsMemBefore (ADDRINT applicationIp, THREADID tid, ADDRINT memoryAddressR
 			}
 		}
 	}
-	ReleaseLock(&Lock);
+	
 }
 
 
@@ -4793,7 +4933,6 @@ VOID WritesMemBefore(ADDRINT applicationIp, THREADID tid, ADDRINT memoryAddressW
 		}
 	}
 
-	GetLock(&Lock, tid+1);
 
 	if (CheckEnabled) {
 
@@ -4898,8 +5037,9 @@ VOID WritesMemBefore(ADDRINT applicationIp, THREADID tid, ADDRINT memoryAddressW
 				if ((*bv)[tid*2+1] == 1) {
 					// means 'need invalidation'
 					//Logger.warn("[tid: %d] write without invalidation: %s (addr: 0x%lx, base 0x%lx offset %ld 0x%lx)", tid, MATracker.getVariableName(a).c_str(), a, MATracker.getBase(a), MATracker.getOffset(a), MATracker.getOffset(a));
+					GetLock(&Lock, tid+1);
 					Logger.warn("[tid: %d] write without invalidation: addr=0x%lx, %s (offset %ld 0x%lx), read at line %d file %s", tid, a, MATracker.getVariableName(a).c_str(), MATracker.getOffsetIndex(a, index), MATracker.getOffsetIndex(a, index), line, filename.c_str());
-
+					ReleaseLock(&Lock);
 				}
 			}
 			else if ( (*bv)[tid*2+1] == 0) {
@@ -4979,7 +5119,9 @@ VOID WritesMemBefore(ADDRINT applicationIp, THREADID tid, ADDRINT memoryAddressW
 			if ( (* (bitVectorForGlobalVariable(a)) )[tid*2] == 1) {
 				if ( (* (bitVectorForGlobalVariable(a)) )[tid*2+1] == 1) {
 					// means 'need invalidation'
+					GetLock(&Lock, tid+1);
 					Logger.warn("[tid: %d] write without invalidation: %s (offset: %ld 0x%lx)", tid, getGlobalVariableName(a), offsetInGlobalVariable(a), offsetInGlobalVariable(a));
+					ReleaseLock(&Lock);
 				}
 			}
 			else if ( (* (bitVectorForGlobalVariable(a)) )[tid*2+1] == 0) {
@@ -5025,6 +5167,7 @@ VOID WritesMemBefore(ADDRINT applicationIp, THREADID tid, ADDRINT memoryAddressW
 			PIN_GetSourceLocation(applicationIp, &col, &line, &filename);
 			PIN_UnlockClient();
 
+			GetLock(&Lock, tid+1);
 			Logger.log("[tid: %d] Memory allocation was done in location: col %d line %d file %s\n", tid, col, line, filename.c_str());
 
 			MATracker.addSource(col, line, filename);
@@ -5049,12 +5192,13 @@ VOID WritesMemBefore(ADDRINT applicationIp, THREADID tid, ADDRINT memoryAddressW
 					MATracker.addVariableName((*GlobalVariableVecIterator).name, offset);
 				}
 			}
+			ReleaseLock(&Lock);
+
 
 			AfterAlloc[tid] = false;
 		}
 	}
 	//Logger.ext_debug("check4 %s", (bitVectorForGlobalVariable(0x6064a0))->to_string().c_str());
-	ReleaseLock(&Lock);
 }	// void WritesMemBefore
 
 
