@@ -12,7 +12,7 @@
  *
  *	History
  *		started from Jun 3, 2012
- *		last updated on Dec 8, 2013
+ *		last updated on Mar 12, 2014
  *
  *	Author
  *		written by Kim, Wooil
@@ -56,25 +56,24 @@ const char *configFileName = "coach.cfg";
 
 
 //	Currently all operations are verified with 64-bit only.
-//	[TODO] make this work with 32-bit binaries
 #if __WORDSIZE == 64
 	#define INT_SIZE	8
 	#define WORD_SIZE	4
 	#define ADDR_MASK	0xFFFFFFFFFFFFFFFC
 #else
-	// 32-bit execution is not verified yet.
+	// [TODO] 32-bit execution is not verified yet.
+	// Probably, virtual machine platform can be used for 32-bit.
 	#define INT_SIZE	4
 	#define WORD_SIZE	4
 	#define ADDR_MASK	0xFFFFFFFC
 #endif
 
-//	[TODO] this is not required. Needs to be deleted.
-#define LINE_SIZE	64
-#define PAD_SIZE 	(LINE_SIZE - INT_SIZE)
+
+#define	LINE_SIZE	64
+#define	PAD_SIZE	(LINE_SIZE - INT_SIZE)
 
 
 using namespace std;
-
 
 
 //-------------------------------------------------------------------
@@ -837,6 +836,7 @@ BOOL			AfterMainTracking;			// if true, address tracking is enabled after main f
 BOOL			MainRunning;				// after main function is started, this is set as true.
 BOOL			MasterThreadOnlyAllocFree;	// if true, memory allocation/free from child threads is not tracked
 BOOL			SrcWriteTracking;
+BOOL			SrcReadTracking;
 
 
 
@@ -860,6 +860,8 @@ struct thread_data_t	NumReads[MAX_THREADS];
 struct thread_data_t	NumWrites[MAX_THREADS];
 
 BOOL			AfterAlloc[MAX_THREADS];	// if true, it is just after memory allocation function.
+ADDRINT			StackBase[MAX_THREADS];
+ADDRINT			StackPointer[MAX_THREADS];
 
 //list<ADDRINT>	WrittenWordsInPrevEpoch[MAX_THREADS];
 set<ADDRINT>	WrittenWordsInPrevEpoch[MAX_THREADS];
@@ -1226,7 +1228,7 @@ VOID* reallocWrapper(CONTEXT *ctxt, AFUNPTR orig_function, THREADID tid, VOID *p
 {
 	VOID *ret;
 
-	Logger.warn("[tid: %d] realloc is called for 0x%p, but not supported completely for now.", tid, ptr);
+	Logger.warn("[tid: %d] realloc is called for %p, but not supported completely for now.", tid, ptr);
 
 	PIN_CallApplicationFunction(ctxt, PIN_ThreadId(),
 		CALLINGSTD_DEFAULT, orig_function,
@@ -1247,7 +1249,7 @@ VOID* reallocWrapper(CONTEXT *ctxt, AFUNPTR orig_function, THREADID tid, VOID *p
 			return ret;
 
 	GetLock(&Lock, tid+1);
-	Logger.log("[tid: %d] realloc with ptr 0x%p, size %d returns 0x%lx\n", tid, ptr, size, (ADDRINT) ret);
+	Logger.log("[tid: %d] realloc with ptr %p, size %d returns 0x%lx\n", tid, ptr, size, (ADDRINT) ret);
 
 	// if return value is NULL, realloc failed. address is not tracked, then.
 	if (ret != NULL) {
@@ -1353,7 +1355,7 @@ VOID* freeWrapper(CONTEXT *ctxt, AFUNPTR orig_function, THREADID tid, VOID *ptr)
 			return ret;
 
 	GetLock(&Lock, tid+1);
-	Logger.log("[tid: %d] free with ptr 0x%p returns.\n", tid, ptr);
+	Logger.log("[tid: %d] free with ptr %p returns.\n", tid, ptr);
 
 	// remove call is moved forward to prevent some wierd writes during free() call.
 	//MATracker.remove((ADDRINT) ptr);
@@ -1369,8 +1371,8 @@ VOID* freeWrapper(CONTEXT *ctxt, AFUNPTR orig_function, THREADID tid, VOID *ptr)
 //---------------------------------------------------------
 
 //	pre-declaration
-VOID ReadsMemBefore (ADDRINT applicationIp, THREADID tid, ADDRINT memoryAddressRead, UINT32 memoryReadSize);
-VOID WritesMemBefore(ADDRINT applicationIp, THREADID tid, ADDRINT memoryAddressWrite, UINT32 memoryWriteSize);
+VOID ReadsMemBefore (ADDRINT applicationIp, THREADID tid, ADDRINT memoryAddressRead, UINT32 memoryReadSize, ADDRINT sp);
+VOID WritesMemBefore(ADDRINT applicationIp, THREADID tid, ADDRINT memoryAddressWrite, UINT32 memoryWriteSize, ADDRINT sp);
 
 
 
@@ -1571,7 +1573,7 @@ void PMC_process(PMCInst function, int tid, ADDRINT addr, int size)
 			if (MutexLocked[tid] == Locked) {
 				AutoInvForLock[tid] = true;
 				// will be cleared in unlockWrapper
-				Logger.warn("[tid: %d] inv all for the lock", tid);
+				Logger.log("[tid: %d] inv all for the lock", tid);
 			}
 			else if (MutexLocked[tid] == Unlocked) {
 
@@ -1586,7 +1588,7 @@ void PMC_process(PMCInst function, int tid, ADDRINT addr, int size)
 
 				//AutoInvForEpoch[tid] = true;
 				// will be cleared in next barrierWrapper
-				Logger.warn("[tid: %d] real inv all", tid);
+				Logger.log("[tid: %d] inv all", tid);
 			}
 			break;
 
@@ -1600,7 +1602,7 @@ void PMC_process(PMCInst function, int tid, ADDRINT addr, int size)
 					PMC_coherence(function, tid, *WrittenWordsIterator[tid], 4);
 
 				WrittenWordsInThisLock[tid].clear();
-				Logger.warn("[tid: %d] wb all for the lock", tid);
+				Logger.log("[tid: %d] wb all for the lock", tid);
 			}
 			else if (MutexLocked[tid] == Unlocked) {
 
@@ -1610,7 +1612,7 @@ void PMC_process(PMCInst function, int tid, ADDRINT addr, int size)
 					PMC_coherence(function, tid, *WrittenWordsIterator[tid], 4);
 
 				WrittenWordsInThisEpoch[tid].clear();
-				Logger.warn("[tid: %d] wb all", tid);
+				Logger.log("[tid: %d] wb all", tid);
 			}
 			break;
 		default:
@@ -1659,7 +1661,7 @@ void PMC_process(PMCInst function, int tid, ADDRINT addr, int size)
 				}
 
 				WrittenWordsInThisLock[tid].clear();
-				Logger.warn("[tid: %d] wb master all for the lock", tid);
+				Logger.log("[tid: %d] wb master all for the lock", tid);
 			}
 			else {
 
@@ -1685,7 +1687,7 @@ void PMC_process(PMCInst function, int tid, ADDRINT addr, int size)
 				}
 
 				WrittenWordsInThisEpoch[tid].clear();
-				Logger.warn("[tid: %d] wb master all", tid);
+				Logger.log("[tid: %d] wb master all", tid);
 			}
 			break;
 		default:
@@ -1754,13 +1756,13 @@ void PMC_process(PMCInst function, int tid, ADDRINT addr, int size)
 
 		case loadBypass:
 			Logger.ext_debug("loadBypass starts.");
-			ReadsMemBefore((ADDRINT) 0, tid, addr, size);
+			ReadsMemBefore((ADDRINT) 0, tid, addr, size, 0);
 			Logger.ext_debug("loadBypass ends.");
 			break;
 
 		case storeBypass:
 			Logger.ext_debug("storeBypass starts.");
-			WritesMemBefore(0, tid, addr, size);
+			WritesMemBefore(0, tid, addr, size, 0);
 			Logger.ext_debug("storeBypass ends.");
 			break;
 
@@ -1964,44 +1966,47 @@ void PMC_process(PMCInst function, int tid, ADDRINT addr, int size)
 VOID inv_word(THREADID tid, VOID *addr)
 {
 	GetLock(&Lock, tid+1);
-	Logger.log("[tid: %d] inv_word -> addr 0x%p", tid, addr);
+	Logger.log("[tid: %d] inv_word -> addr %p", tid, addr);
 	PMC_process(invalidation, tid, (ADDRINT) addr, 4);
 	ReleaseLock(&Lock);
 	return;
 }
 
+
 VOID inv_dword(THREADID tid, VOID *addr)
 {
 	GetLock(&Lock, tid+1);
-	Logger.log("[tid: %d] inv_dword -> addr 0x%p", tid, addr);
+	Logger.log("[tid: %d] inv_dword -> addr %p", tid, addr);
 	PMC_process(invalidation, tid, (ADDRINT) addr, 8);
 	ReleaseLock(&Lock);
 	return;
 }
 
+
 VOID inv_qword(THREADID tid, VOID *addr)
 {
 	GetLock(&Lock, tid+1);
-	Logger.log("[tid: %d] inv_qword -> addr 0x%p", tid, addr);
+	Logger.log("[tid: %d] inv_qword -> addr %p", tid, addr);
 	PMC_process(invalidation, tid, (ADDRINT) addr, 16);
 	ReleaseLock(&Lock);
 	return;
 }
 
+
 VOID inv_range(THREADID tid, VOID *addr, int size)
 {
 	GetLock(&Lock, tid+1);
-	Logger.log("[tid: %d] inv_range -> addr 0x%p, size %d 0x%x", tid, addr, size, size);
+	Logger.log("[tid: %d] inv_range -> addr %p, size %d(0x%x)", tid, addr, size, size);
 	PMC_process(invalidation, tid, (ADDRINT) addr, size);
 	ReleaseLock(&Lock);
 	return;
 }
 
+
 VOID inv_all(THREADID tid)
 {
 	GetLock(&Lock, tid+1);
-	// 0x%p is not required becuase %p shows 0x.
-	Logger.log("[tid: %d] inv_all", tid);
+	//Logger.log("[tid: %d] inv_all", tid);
 	PMC_process(invalidation, tid, 0, 1);
 	ReleaseLock(&Lock);
 	return;
@@ -2011,8 +2016,6 @@ VOID inv_all(THREADID tid)
 VOID inv_master_all(THREADID tid)
 {
 	GetLock(&Lock, tid+1);
-	// 0x%p is not required becuase %p shows 0x.
-	Logger.log("[tid: %d] inv_master_all", tid);
 	PMC_process(invalidation, tid, 0, 2);
 	ReleaseLock(&Lock);
 	return;
@@ -2029,6 +2032,7 @@ VOID wb_word(THREADID tid, VOID *addr)
 	return;
 }
 
+
 VOID wb_dword(THREADID tid, VOID *addr)
 {
 	GetLock(&Lock, tid+1);
@@ -2037,6 +2041,7 @@ VOID wb_dword(THREADID tid, VOID *addr)
 	ReleaseLock(&Lock);
 	return;
 }
+
 
 VOID wb_qword(THREADID tid, VOID *addr)
 {
@@ -2047,11 +2052,11 @@ VOID wb_qword(THREADID tid, VOID *addr)
 	return;
 }
 
+
 VOID wb_range(THREADID tid, VOID *addr, int size)
 {
 	GetLock(&Lock, tid+1);
-	// 0x%p is not required becuase %p shows 0x.
-	Logger.log("[tid: %d] wb_range -> addr %p, size %d 0x%x", tid, addr, size, size);
+	Logger.log("[tid: %d] wb_range -> addr %p, size %d(0x%x)", tid, addr, size, size);
 	PMC_process(writeback, tid, (ADDRINT) addr, size);
 	ReleaseLock(&Lock);
 	return;
@@ -2061,18 +2066,16 @@ VOID wb_range(THREADID tid, VOID *addr, int size)
 VOID wb_all(THREADID tid)
 {
 	GetLock(&Lock, tid+1);
-	// 0x%p is not required becuase %p shows 0x.
-	Logger.log("[tid: %d] wb_all", tid);
+	//Logger.log("[tid: %d] wb_all", tid);
 	PMC_process(writeback, tid, 0, 1);
 	ReleaseLock(&Lock);
 	return;
 }
 
+
 VOID wb_master_all(THREADID tid)
 {
 	GetLock(&Lock, tid+1);
-	// 0x%p is not required becuase %p shows 0x.
-	Logger.log("[tid: %d] wb_master_all", tid);
 	PMC_process(writeback, tid, 0, 2);
 	ReleaseLock(&Lock);
 	return;
@@ -2083,29 +2086,32 @@ VOID wb_master_all(THREADID tid)
 VOID wb_inv_word(THREADID tid, VOID *addr)
 {
 	GetLock(&Lock, tid+1);
-	Logger.debug("[tid: %d] wb_inv_word -> addr 0x%p", tid, addr);
+	Logger.debug("[tid: %d] wb_inv_word -> addr %p", tid, addr);
 	PMC_process(writebackInvalidation, tid, (ADDRINT) addr, 4);
 	ReleaseLock(&Lock);
 	return;
 }
 
+
 VOID wb_inv_dword(THREADID tid, VOID *addr)
 {
 	GetLock(&Lock, tid+1);
-	Logger.debug("[tid: %d] wb_inv_dword -> addr 0x%p", tid, addr);
+	Logger.debug("[tid: %d] wb_inv_dword -> addr %p", tid, addr);
 	PMC_process(writebackInvalidation, tid, (ADDRINT) addr, 8);
 	ReleaseLock(&Lock);
 	return;
 }
 
+
 VOID wb_inv_qword(THREADID tid, VOID *addr)
 {
 	GetLock(&Lock, tid+1);
-	Logger.debug("[tid: %d] wb_inv_qword -> addr 0x%p", tid, addr);
+	Logger.debug("[tid: %d] wb_inv_qword -> addr %p", tid, addr);
 	PMC_process(writebackInvalidation, tid, (ADDRINT) addr, 16);
 	ReleaseLock(&Lock);
 	return;
 }
+
 
 VOID wb_inv_range(THREADID tid, VOID *addr, int size)
 {
@@ -2116,24 +2122,23 @@ VOID wb_inv_range(THREADID tid, VOID *addr, int size)
 	return;
 }
 
+
 VOID wb_inv_all(THREADID tid)
 {
 	GetLock(&Lock, tid+1);
-	Logger.debug("[tid: %d] wb_inv_all", tid);
 	PMC_process(writebackInvalidation, tid, 0, 1);
 	ReleaseLock(&Lock);
 	return;
 }
 
+
 VOID wb_inv_master_all(THREADID tid)
 {
 	GetLock(&Lock, tid+1);
-	Logger.debug("[tid: %d] wb_inv_master_all", tid);
 	PMC_process(writebackInvalidation, tid, 0, 2);
 	ReleaseLock(&Lock);
 	return;
 }
-
 
 
 // Load/Store Bypass
@@ -2142,7 +2147,7 @@ VOID* ld_bypass(THREADID tid, VOID *addr)
 	VOID *ret;
 
 	GetLock(&Lock, tid+1);
-	Logger.debug("[tid: %d] ld_bypass -> addr 0x%p", tid, addr);
+	Logger.debug("[tid: %d] ld_bypass -> addr %p", tid, addr);
 	PMC_process(loadBypass, tid, (ADDRINT) addr, 4);
 
 	// original meaning of the instruction
@@ -2152,10 +2157,11 @@ VOID* ld_bypass(THREADID tid, VOID *addr)
 	return ret;
 }
 
+
 VOID st_bypass(THREADID tid, VOID *addr, int value)
 {
 	GetLock(&Lock, tid+1);
-	Logger.debug("[tid: %d] st_bypass -> addr 0x%p", tid, addr);
+	Logger.debug("[tid: %d] st_bypass -> addr %p", tid, addr);
 	PMC_process(storeBypass, tid, (ADDRINT) addr, 4);
 
 	// original meaning of the instruction
@@ -2166,7 +2172,7 @@ VOID st_bypass(THREADID tid, VOID *addr, int value)
 }
 
 // Load Mem
-// ldmem is deprecated
+// ldmem is deprecated since its use results in non-deterministic behavior.
 /*
 VOID* ldmem(THREADID tid, VOID *addr)
 {
@@ -2190,39 +2196,41 @@ VOID* ldmem(THREADID tid, VOID *addr)
 }
 */
 
+
 // Writeback merge
 VOID wb_merge(THREADID tid, VOID *addr, int size)
 {
 	GetLock(&Lock, tid+1);
-	Logger.debug("[tid: %d] wb_merge -> addr 0x%p size %d 0x%x", tid, addr, size, size);
+	Logger.debug("[tid: %d] wb_merge -> addr %p size %d 0x%x", tid, addr, size, size);
 	PMC_process(writebackMerge, tid, (ADDRINT) addr, size);
 	ReleaseLock(&Lock);
 	return;
 }
 
+
 // Writeback Reserve
 VOID wb_reserve(THREADID tid, VOID *addr, int size)
 {
 	GetLock(&Lock, tid+1);
-	Logger.debug("[tid: %d] wb_reserve -> addr 0x%p size %d 0x%x", tid, addr, size, size);
+	Logger.debug("[tid: %d] wb_reserve -> addr %p size %d 0x%x", tid, addr, size, size);
 	PMC_process(writebackReserve, tid, (ADDRINT) addr, size);
 	ReleaseLock(&Lock);
 	return;
 }
 
+
 // Writefirst
 VOID wr_first(THREADID tid, VOID *addr, int size)
 {
 	GetLock(&Lock, tid+1);
-	Logger.debug("[tid: %d] writefirst -> addr 0x%p, size %d 0x%x", tid, addr, size, size);
+	Logger.debug("[tid: %d] writefirst -> addr %p, size %d 0x%x", tid, addr, size, size);
 	PMC_process(writeFirst, tid, (ADDRINT) addr, size);
 	ReleaseLock(&Lock);
 	return;
 }
 
 
-
-
+// Barrier functions
 VOID* barrierInitWrapper(CONTEXT *ctxt, AFUNPTR orig_function, THREADID tid, VOID* bar, VOID* some, int num)
 {
 	VOID *ret;
@@ -2267,8 +2275,9 @@ VOID* threadCreateWrapper(CONTEXT *ctxt, AFUNPTR orig_function, THREADID tid, VO
 {
 	VOID *ret;
 
-
+	GetLock(&Lock, tid+1);
 	Logger.log("[tid: %d] Creating thread wrapper", tid);
+	ReleaseLock(&Lock);
 
 	PIN_CallApplicationFunction(ctxt, PIN_ThreadId(),
 		CALLINGSTD_DEFAULT, orig_function,
@@ -2287,8 +2296,9 @@ VOID* threadJoinWrapper(CONTEXT *ctxt, AFUNPTR orig_function, THREADID tid, VOID
 {
 	VOID *ret;
 
-
+	GetLock(&Lock, tid+1);
 	Logger.log("[tid: %d] Joining thread wrapper", tid);
+	ReleaseLock(&Lock);
 
 	PIN_CallApplicationFunction(ctxt, PIN_ThreadId(),
 		CALLINGSTD_DEFAULT, orig_function,
@@ -2305,9 +2315,10 @@ VOID* gompBarrierWrapper(CONTEXT *ctxt, AFUNPTR orig_function, THREADID tid, VOI
 {
 	VOID *ret;
 
-
+	GetLock(&Lock, tid+1);
 	//Logger.log("[tid: %d] Executing GOMP barrier wrapper", tid);
 	CheckBarrierResultBefore(tid);
+	ReleaseLock(&Lock);
 	
 	PIN_CallApplicationFunction(ctxt, PIN_ThreadId(),
 		CALLINGSTD_DEFAULT, orig_function,
@@ -2323,8 +2334,11 @@ VOID* omp_set_num_threads_Wrapper(CONTEXT *ctxt, AFUNPTR orig_function, THREADID
 {
 	VOID *ret;
 
+	GetLock(&Lock, tid+1);
 	Logger.log("[tid: %d] OpenMP number of threads is set to %d.\n", tid, num);
 	BarrierNumber = num;
+	ReleaseLock(&Lock);
+
 	PIN_CallApplicationFunction(ctxt, PIN_ThreadId(),
 		CALLINGSTD_DEFAULT, orig_function,
 		PIN_PARG(VOID *), &ret,		// void
@@ -2352,6 +2366,7 @@ VOID* gomp_fini_work_share_Wrapper(CONTEXT *ctxt, AFUNPTR orig_function, THREADI
 		PIN_PARG(VOID *), bar, 		// struct gomp_work_share *
 		PIN_PARG_END());
 	DuringBarrierFunc[tid] = false;
+
 	GetLock(&Lock, tid+1);
 	Logger.log("[tid: %d] Executing gomp_fini_work_share wrapper 3", tid);
 	ReleaseLock(&Lock);
@@ -2364,8 +2379,9 @@ VOID* GOMP_parallel_end_Wrapper(CONTEXT *ctxt, AFUNPTR orig_function, THREADID t
 {
 	VOID *ret;
 
-
+	GetLock(&Lock, tid+1);
 	Logger.log("[tid: %d] Executing GOM_parallel_end wrapper", tid);
+	ReleaseLock(&Lock);
 	
 	PIN_CallApplicationFunction(ctxt, PIN_ThreadId(),
 		CALLINGSTD_DEFAULT, orig_function,
@@ -2373,11 +2389,11 @@ VOID* GOMP_parallel_end_Wrapper(CONTEXT *ctxt, AFUNPTR orig_function, THREADID t
 		PIN_PARG_END());
 	CheckBarrierResultBeforeGOMPImplicit(tid);
 
-
 	return ret;
 }
 
 
+// Lock functions
 VOID* lockInitWrapper(CONTEXT *ctxt, AFUNPTR orig_function, THREADID tid, VOID* mutex, VOID* attr)
 {
 	VOID *ret;
@@ -2406,7 +2422,6 @@ VOID* lockInitWrapper(CONTEXT *ctxt, AFUNPTR orig_function, THREADID tid, VOID* 
 }
 
 
-
 VOID* lockWrapper(CONTEXT *ctxt, AFUNPTR orig_function, THREADID tid, VOID* mutex)
 {
 	VOID *ret;
@@ -2426,6 +2441,7 @@ VOID* lockWrapper(CONTEXT *ctxt, AFUNPTR orig_function, THREADID tid, VOID* mute
 
 	MutexLocked[tid] = Locked;
 	MutexLock[tid] = mutex;
+
 	GetLock(&Lock, tid+1);
 	Logger.log("[tid: %d] Lock 0x%x", tid, mutex);
 	ReleaseLock(&Lock);
@@ -2514,8 +2530,6 @@ void AnalyzeCriticalSection(int tid)
 }
 
 
-
-
 VOID* unlockWrapper(CONTEXT *ctxt, AFUNPTR orig_function, THREADID tid, VOID* mutex)
 {
 	VOID *ret;
@@ -2550,8 +2564,7 @@ VOID* unlockWrapper(CONTEXT *ctxt, AFUNPTR orig_function, THREADID tid, VOID* mu
 }
 
 
-
-
+// Condition
 VOID* condInitWrapper(CONTEXT *ctxt, AFUNPTR orig_function, THREADID tid, VOID* cond, VOID* attr)
 {
 	VOID *ret;
@@ -2627,7 +2640,6 @@ VOID* condWaitNullWrapper(CONTEXT *ctxt, AFUNPTR orig_function, THREADID tid, VO
 }
 
 
-
 VOID* condSignalWrapper(CONTEXT *ctxt, AFUNPTR orig_function, THREADID tid, VOID* cond)
 {
 	VOID *ret;
@@ -2660,7 +2672,6 @@ VOID* condBroadcastWrapper(CONTEXT *ctxt, AFUNPTR orig_function, THREADID tid, V
 		PIN_PARG(VOID *), &ret, 
 		PIN_PARG(VOID *), cond, 
 		PIN_PARG_END());
-
 	
 	GetLock(&Lock, tid+1);
 	DuringCondFunc[tid] = false;
@@ -2810,6 +2821,7 @@ VOID ImageLoad(IMG img, VOID *v)
 
 	// malloc is used for many libraries which are executed by default.
 	// To track our interested variables only, malloc_pmc is used in the application code.
+	
 	rtn = RTN_FindByName(img, "malloc_pmc");
 	if (RTN_Valid(rtn)) {
 		PROTO proto = PROTO_Allocate( PIN_PARG(VOID *), CALLINGSTD_DEFAULT,
@@ -2836,7 +2848,7 @@ VOID ImageLoad(IMG img, VOID *v)
 			IARG_END);
 	}
 
-	// iacoma
+	// Mangled name is different on iacoma10 machine.
 	rtn = RTN_FindByName(img, "_Z10malloc_pmcm");
 	if (RTN_Valid(rtn)) {
 		PROTO proto = PROTO_Allocate( PIN_PARG(VOID *), CALLINGSTD_DEFAULT,
@@ -2849,6 +2861,7 @@ VOID ImageLoad(IMG img, VOID *v)
 			IARG_FUNCARG_ENTRYPOINT_VALUE, 0, 
 			IARG_END);
 	}
+	
 
 
 	rtn = RTN_FindByName(img, "calloc_pmc");
@@ -2878,7 +2891,6 @@ VOID ImageLoad(IMG img, VOID *v)
 			IARG_FUNCARG_ENTRYPOINT_VALUE, 1, 
 			IARG_END);
 	}
-
 
 	rtn = RTN_FindByName(img, "_Z10calloc_pmcmm");
 	if (RTN_Valid(rtn)) {
@@ -2998,7 +3010,28 @@ VOID ImageLoad(IMG img, VOID *v)
 	if (RTN_Valid(rtn)) {
 		PROTO proto = PROTO_Allocate( PIN_PARG(void), CALLINGSTD_DEFAULT,
 			"inv_word", PIN_PARG(unsigned long), PIN_PARG_END() );
-		//RTN_Replace(rtn, AFUNPTR(inv_word));
+		RTN_ReplaceSignature(rtn, AFUNPTR(inv_word),
+			IARG_PROTOTYPE, proto,
+			IARG_THREAD_ID,
+			IARG_FUNCARG_ENTRYPOINT_VALUE, 0, 
+			IARG_END);
+	}
+
+	rtn = RTN_FindByName(img, "sesc_inv_word");
+	if (RTN_Valid(rtn)) {
+		PROTO proto = PROTO_Allocate( PIN_PARG(void), CALLINGSTD_DEFAULT,
+			"inv_word", PIN_PARG(unsigned long), PIN_PARG_END() );
+		RTN_ReplaceSignature(rtn, AFUNPTR(inv_word),
+			IARG_PROTOTYPE, proto,
+			IARG_THREAD_ID,
+			IARG_FUNCARG_ENTRYPOINT_VALUE, 0, 
+			IARG_END);
+	}
+
+	rtn = RTN_FindByName(img, "_Z13sesc_inv_wordPv");
+	if (RTN_Valid(rtn)) {
+		PROTO proto = PROTO_Allocate( PIN_PARG(void), CALLINGSTD_DEFAULT,
+			"inv_word", PIN_PARG(unsigned long), PIN_PARG_END() );
 		RTN_ReplaceSignature(rtn, AFUNPTR(inv_word),
 			IARG_PROTOTYPE, proto,
 			IARG_THREAD_ID,
@@ -3018,6 +3051,28 @@ VOID ImageLoad(IMG img, VOID *v)
 	}
 
 	rtn = RTN_FindByName(img, "_Z9inv_dwordPv");
+	if (RTN_Valid(rtn)) {
+		PROTO proto = PROTO_Allocate( PIN_PARG(void), CALLINGSTD_DEFAULT,
+			"inv_dword", PIN_PARG(unsigned long), PIN_PARG_END() );
+		RTN_ReplaceSignature(rtn, AFUNPTR(inv_dword),
+			IARG_PROTOTYPE, proto,
+			IARG_THREAD_ID,
+			IARG_FUNCARG_ENTRYPOINT_VALUE, 0, 
+			IARG_END);
+	}
+
+	rtn = RTN_FindByName(img, "sesc_inv_dword");
+	if (RTN_Valid(rtn)) {
+		PROTO proto = PROTO_Allocate( PIN_PARG(void), CALLINGSTD_DEFAULT,
+			"inv_dword", PIN_PARG(unsigned long), PIN_PARG_END() );
+		RTN_ReplaceSignature(rtn, AFUNPTR(inv_dword),
+			IARG_PROTOTYPE, proto,
+			IARG_THREAD_ID,
+			IARG_FUNCARG_ENTRYPOINT_VALUE, 0, 
+			IARG_END);
+	}
+
+	rtn = RTN_FindByName(img, "_Z14sesc_inv_dwordPv");
 	if (RTN_Valid(rtn)) {
 		PROTO proto = PROTO_Allocate( PIN_PARG(void), CALLINGSTD_DEFAULT,
 			"inv_dword", PIN_PARG(unsigned long), PIN_PARG_END() );
@@ -3050,6 +3105,27 @@ VOID ImageLoad(IMG img, VOID *v)
 			IARG_END);
 	}
 
+ 	rtn = RTN_FindByName(img, "sesc_inv_qword");
+	if (RTN_Valid(rtn)) {
+		PROTO proto = PROTO_Allocate( PIN_PARG(void), CALLINGSTD_DEFAULT,
+			"inv_qword", PIN_PARG(unsigned long), PIN_PARG_END() );
+		RTN_ReplaceSignature(rtn, AFUNPTR(inv_qword),
+			IARG_PROTOTYPE, proto,
+			IARG_THREAD_ID,
+			IARG_FUNCARG_ENTRYPOINT_VALUE, 0, 
+			IARG_END);
+	}
+
+ 	rtn = RTN_FindByName(img, "_Z17sesc_wb_inv_qwordPv");
+	if (RTN_Valid(rtn)) {
+		PROTO proto = PROTO_Allocate( PIN_PARG(void), CALLINGSTD_DEFAULT,
+			"inv_qword", PIN_PARG(unsigned long), PIN_PARG_END() );
+		RTN_ReplaceSignature(rtn, AFUNPTR(inv_qword),
+			IARG_PROTOTYPE, proto,
+			IARG_THREAD_ID,
+			IARG_FUNCARG_ENTRYPOINT_VALUE, 0, 
+			IARG_END);
+	}
 
 	rtn = RTN_FindByName(img, "inv_range");
 	if (RTN_Valid(rtn)) {
@@ -3075,6 +3151,29 @@ VOID ImageLoad(IMG img, VOID *v)
 			IARG_END);
 	}
 
+	rtn = RTN_FindByName(img, "sesc_inv_range");
+	if (RTN_Valid(rtn)) {
+		PROTO proto = PROTO_Allocate( PIN_PARG(void), CALLINGSTD_DEFAULT,
+			"inv_range", PIN_PARG(unsigned long), PIN_PARG(int), PIN_PARG_END() );
+		RTN_ReplaceSignature(rtn, AFUNPTR(inv_range),
+			IARG_PROTOTYPE, proto,
+			IARG_THREAD_ID,
+			IARG_FUNCARG_ENTRYPOINT_VALUE, 0, 
+			IARG_FUNCARG_ENTRYPOINT_VALUE, 1, 
+			IARG_END);
+	}
+
+	rtn = RTN_FindByName(img, "_Z14sesc_inv_rangePvi");
+	if (RTN_Valid(rtn)) {
+		PROTO proto = PROTO_Allocate( PIN_PARG(void), CALLINGSTD_DEFAULT,
+			"inv_range", PIN_PARG(unsigned long), PIN_PARG(int), PIN_PARG_END() );
+		RTN_ReplaceSignature(rtn, AFUNPTR(inv_range),
+			IARG_PROTOTYPE, proto,
+			IARG_THREAD_ID,
+			IARG_FUNCARG_ENTRYPOINT_VALUE, 0, 
+			IARG_FUNCARG_ENTRYPOINT_VALUE, 1, 
+			IARG_END);
+	}
 
 	rtn = RTN_FindByName(img, "inv_all");
 	if (RTN_Valid(rtn)) {
@@ -3096,6 +3195,25 @@ VOID ImageLoad(IMG img, VOID *v)
 			IARG_END);
 	}
 
+	rtn = RTN_FindByName(img, "sesc_inv_all");
+	if (RTN_Valid(rtn)) {
+		PROTO proto = PROTO_Allocate( PIN_PARG(void), CALLINGSTD_DEFAULT,
+			"inv_all", PIN_PARG_END() );
+		RTN_ReplaceSignature(rtn, AFUNPTR(inv_all),
+			IARG_PROTOTYPE, proto,
+			IARG_THREAD_ID,
+			IARG_END);
+	}
+
+	rtn = RTN_FindByName(img, "_Z12sesc_inv_allv");
+	if (RTN_Valid(rtn)) {
+		PROTO proto = PROTO_Allocate( PIN_PARG(void), CALLINGSTD_DEFAULT,
+			"inv_all", PIN_PARG_END() );
+		RTN_ReplaceSignature(rtn, AFUNPTR(inv_all),
+			IARG_PROTOTYPE, proto,
+			IARG_THREAD_ID,
+			IARG_END);
+	}
 
 	rtn = RTN_FindByName(img, "inv_master_all");
 	if (RTN_Valid(rtn)) {
@@ -3108,6 +3226,26 @@ VOID ImageLoad(IMG img, VOID *v)
 	}
 
 	rtn = RTN_FindByName(img, "_Z14inv_master_allv");
+	if (RTN_Valid(rtn)) {
+		PROTO proto = PROTO_Allocate( PIN_PARG(void), CALLINGSTD_DEFAULT,
+			"inv_master_all", PIN_PARG_END() );
+		RTN_ReplaceSignature(rtn, AFUNPTR(inv_master_all),
+			IARG_PROTOTYPE, proto,
+			IARG_THREAD_ID,
+			IARG_END);
+	}
+
+	rtn = RTN_FindByName(img, "sesc_inv_master_all");
+	if (RTN_Valid(rtn)) {
+		PROTO proto = PROTO_Allocate( PIN_PARG(void), CALLINGSTD_DEFAULT,
+			"inv_master_all", PIN_PARG_END() );
+		RTN_ReplaceSignature(rtn, AFUNPTR(inv_master_all),
+			IARG_PROTOTYPE, proto,
+			IARG_THREAD_ID,
+			IARG_END);
+	}
+
+	rtn = RTN_FindByName(img, "_Z19sesc_inv_master_allv");
 	if (RTN_Valid(rtn)) {
 		PROTO proto = PROTO_Allocate( PIN_PARG(void), CALLINGSTD_DEFAULT,
 			"inv_master_all", PIN_PARG_END() );
@@ -3141,6 +3279,28 @@ VOID ImageLoad(IMG img, VOID *v)
 			IARG_END);
 	}
 
+	rtn = RTN_FindByName(img, "sesc_wb_word");
+	if (RTN_Valid(rtn)) {
+		PROTO proto = PROTO_Allocate( PIN_PARG(void), CALLINGSTD_DEFAULT,
+			"wb_word", PIN_PARG(unsigned long), PIN_PARG_END() );
+		RTN_ReplaceSignature(rtn, AFUNPTR(wb_word),
+			IARG_PROTOTYPE, proto,
+			IARG_THREAD_ID,
+			IARG_FUNCARG_ENTRYPOINT_VALUE, 0, 
+			IARG_END);
+	}
+
+	rtn = RTN_FindByName(img, "_Z12sesc_wb_wordPv");
+	if (RTN_Valid(rtn)) {
+		PROTO proto = PROTO_Allocate( PIN_PARG(void), CALLINGSTD_DEFAULT,
+			"wb_word", PIN_PARG(unsigned long), PIN_PARG_END() );
+		RTN_ReplaceSignature(rtn, AFUNPTR(wb_word),
+			IARG_PROTOTYPE, proto,
+			IARG_THREAD_ID,
+			IARG_FUNCARG_ENTRYPOINT_VALUE, 0, 
+			IARG_END);
+	}
+
 	rtn = RTN_FindByName(img, "wb_dword");
 	if (RTN_Valid(rtn)) {
 		PROTO proto = PROTO_Allocate( PIN_PARG(void), CALLINGSTD_DEFAULT,
@@ -3163,6 +3323,28 @@ VOID ImageLoad(IMG img, VOID *v)
 			IARG_END);
 	}
 
+	rtn = RTN_FindByName(img, "sesc_wb_dword");
+	if (RTN_Valid(rtn)) {
+		PROTO proto = PROTO_Allocate( PIN_PARG(void), CALLINGSTD_DEFAULT,
+			"wb_dword", PIN_PARG(unsigned long), PIN_PARG_END() );
+		RTN_ReplaceSignature(rtn, AFUNPTR(wb_dword),
+			IARG_PROTOTYPE, proto,
+			IARG_THREAD_ID,
+			IARG_FUNCARG_ENTRYPOINT_VALUE, 0, 
+			IARG_END);
+	}
+
+	rtn = RTN_FindByName(img, "_Z13sesc_wb_dwordPv");
+	if (RTN_Valid(rtn)) {
+		PROTO proto = PROTO_Allocate( PIN_PARG(void), CALLINGSTD_DEFAULT,
+			"wb_dword", PIN_PARG(unsigned long), PIN_PARG_END() );
+		RTN_ReplaceSignature(rtn, AFUNPTR(wb_dword),
+			IARG_PROTOTYPE, proto,
+			IARG_THREAD_ID,
+			IARG_FUNCARG_ENTRYPOINT_VALUE, 0, 
+			IARG_END);
+	}
+
 	rtn = RTN_FindByName(img, "wb_qword");
 	if (RTN_Valid(rtn)) {
 		PROTO proto = PROTO_Allocate( PIN_PARG(void), CALLINGSTD_DEFAULT,
@@ -3175,6 +3357,28 @@ VOID ImageLoad(IMG img, VOID *v)
 	}
 
 	rtn = RTN_FindByName(img, "_Z8wb_qwordPv");
+	if (RTN_Valid(rtn)) {
+		PROTO proto = PROTO_Allocate( PIN_PARG(void), CALLINGSTD_DEFAULT,
+			"wb_qword", PIN_PARG(unsigned long), PIN_PARG_END() );
+		RTN_ReplaceSignature(rtn, AFUNPTR(wb_qword),
+			IARG_PROTOTYPE, proto,
+			IARG_THREAD_ID,
+			IARG_FUNCARG_ENTRYPOINT_VALUE, 0, 
+			IARG_END);
+	}
+
+	rtn = RTN_FindByName(img, "sesc_wb_qword");
+	if (RTN_Valid(rtn)) {
+		PROTO proto = PROTO_Allocate( PIN_PARG(void), CALLINGSTD_DEFAULT,
+			"wb_qword", PIN_PARG(unsigned long), PIN_PARG_END() );
+		RTN_ReplaceSignature(rtn, AFUNPTR(wb_qword),
+			IARG_PROTOTYPE, proto,
+			IARG_THREAD_ID,
+			IARG_FUNCARG_ENTRYPOINT_VALUE, 0, 
+			IARG_END);
+	}
+
+	rtn = RTN_FindByName(img, "_Z13sesc_wb_qwordPv");
 	if (RTN_Valid(rtn)) {
 		PROTO proto = PROTO_Allocate( PIN_PARG(void), CALLINGSTD_DEFAULT,
 			"wb_qword", PIN_PARG(unsigned long), PIN_PARG_END() );
@@ -3209,6 +3413,30 @@ VOID ImageLoad(IMG img, VOID *v)
 			IARG_END);
 	}
 
+	rtn = RTN_FindByName(img, "sesc_wb_range");
+	if (RTN_Valid(rtn)) {
+		PROTO proto = PROTO_Allocate( PIN_PARG(void), CALLINGSTD_DEFAULT,
+			"wb_range", PIN_PARG(unsigned long), PIN_PARG(int), PIN_PARG_END() );
+		RTN_ReplaceSignature(rtn, AFUNPTR(wb_range),
+			IARG_PROTOTYPE, proto,
+			IARG_THREAD_ID,
+			IARG_FUNCARG_ENTRYPOINT_VALUE, 0, 
+			IARG_FUNCARG_ENTRYPOINT_VALUE, 1, 
+			IARG_END);
+	}
+
+	rtn = RTN_FindByName(img, "_Z13sesc_wb_rangePvi");
+	if (RTN_Valid(rtn)) {
+		PROTO proto = PROTO_Allocate( PIN_PARG(void), CALLINGSTD_DEFAULT,
+			"wb_range", PIN_PARG(unsigned long), PIN_PARG(int), PIN_PARG_END() );
+		RTN_ReplaceSignature(rtn, AFUNPTR(wb_range),
+			IARG_PROTOTYPE, proto,
+			IARG_THREAD_ID,
+			IARG_FUNCARG_ENTRYPOINT_VALUE, 0, 
+			IARG_FUNCARG_ENTRYPOINT_VALUE, 1, 
+			IARG_END);
+	}
+
 	rtn = RTN_FindByName(img, "wb_all");
 	if (RTN_Valid(rtn)) {
 		PROTO proto = PROTO_Allocate( PIN_PARG(void), CALLINGSTD_DEFAULT,
@@ -3229,6 +3457,25 @@ VOID ImageLoad(IMG img, VOID *v)
 			IARG_END);
 	}
 
+	rtn = RTN_FindByName(img, "sesc_wb_all");
+	if (RTN_Valid(rtn)) {
+		PROTO proto = PROTO_Allocate( PIN_PARG(void), CALLINGSTD_DEFAULT,
+			"wb_all", PIN_PARG_END() );
+		RTN_ReplaceSignature(rtn, AFUNPTR(wb_all),
+			IARG_PROTOTYPE, proto,
+			IARG_THREAD_ID,
+			IARG_END);
+	}
+
+	rtn = RTN_FindByName(img, "_Z11sesc_wb_allv");
+	if (RTN_Valid(rtn)) {
+		PROTO proto = PROTO_Allocate( PIN_PARG(void), CALLINGSTD_DEFAULT,
+			"wb_all", PIN_PARG_END() );
+		RTN_ReplaceSignature(rtn, AFUNPTR(wb_all),
+			IARG_PROTOTYPE, proto,
+			IARG_THREAD_ID,
+			IARG_END);
+	}
 
 	rtn = RTN_FindByName(img, "wb_master_all");
 	if (RTN_Valid(rtn)) {
@@ -3250,8 +3497,61 @@ VOID ImageLoad(IMG img, VOID *v)
 			IARG_END);
 	}
 
+	rtn = RTN_FindByName(img, "sesc_wb_master_all");
+	if (RTN_Valid(rtn)) {
+		PROTO proto = PROTO_Allocate( PIN_PARG(void), CALLINGSTD_DEFAULT,
+			"wb_master_all", PIN_PARG_END() );
+		RTN_ReplaceSignature(rtn, AFUNPTR(wb_master_all),
+			IARG_PROTOTYPE, proto,
+			IARG_THREAD_ID,
+			IARG_END);
+	}
+
+	rtn = RTN_FindByName(img, "_Z18sesc_wb_master_allv");
+	if (RTN_Valid(rtn)) {
+		PROTO proto = PROTO_Allocate( PIN_PARG(void), CALLINGSTD_DEFAULT,
+			"wb_master_all", PIN_PARG_END() );
+		RTN_ReplaceSignature(rtn, AFUNPTR(wb_master_all),
+			IARG_PROTOTYPE, proto,
+			IARG_THREAD_ID,
+			IARG_END);
+	}
+
+
 	// Writeback & Invalidation
 	rtn = RTN_FindByName(img, "wb_inv_word");
+	if (RTN_Valid(rtn)) {
+		PROTO proto = PROTO_Allocate( PIN_PARG(void), CALLINGSTD_DEFAULT,
+			"wb_inv_word", PIN_PARG(unsigned long), PIN_PARG_END() );
+		RTN_ReplaceSignature(rtn, AFUNPTR(wb_inv_word),
+			IARG_PROTOTYPE, proto,
+			IARG_THREAD_ID,
+			IARG_FUNCARG_ENTRYPOINT_VALUE, 0, 
+			IARG_END);
+	}
+
+	rtn = RTN_FindByName(img, "_Z11wb_inv_wordPv");
+	if (RTN_Valid(rtn)) {
+		PROTO proto = PROTO_Allocate( PIN_PARG(void), CALLINGSTD_DEFAULT,
+			"wb_inv_word", PIN_PARG(unsigned long), PIN_PARG_END() );
+		RTN_ReplaceSignature(rtn, AFUNPTR(wb_inv_word),
+			IARG_PROTOTYPE, proto,
+			IARG_THREAD_ID,
+			IARG_FUNCARG_ENTRYPOINT_VALUE, 0, 
+			IARG_END);
+	}
+
+	rtn = RTN_FindByName(img, "sesc_wb_inv_word");
+	if (RTN_Valid(rtn)) {
+		PROTO proto = PROTO_Allocate( PIN_PARG(void), CALLINGSTD_DEFAULT,
+			"wb_inv_word", PIN_PARG(unsigned long), PIN_PARG_END() );
+		RTN_ReplaceSignature(rtn, AFUNPTR(wb_inv_word),
+			IARG_PROTOTYPE, proto,
+			IARG_THREAD_ID,
+			IARG_FUNCARG_ENTRYPOINT_VALUE, 0, 
+			IARG_END);
+	}
+	rtn = RTN_FindByName(img, "_Z16sesc_wb_inv_wordPv");
 	if (RTN_Valid(rtn)) {
 		PROTO proto = PROTO_Allocate( PIN_PARG(void), CALLINGSTD_DEFAULT,
 			"wb_inv_word", PIN_PARG(unsigned long), PIN_PARG_END() );
@@ -3273,7 +3573,73 @@ VOID ImageLoad(IMG img, VOID *v)
 			IARG_END);
 	}
 
+	rtn = RTN_FindByName(img, "_Z12wb_inv_dwordPv");
+	if (RTN_Valid(rtn)) {
+		PROTO proto = PROTO_Allocate( PIN_PARG(void), CALLINGSTD_DEFAULT,
+			"wb_inv_dword", PIN_PARG(unsigned long), PIN_PARG_END() );
+		RTN_ReplaceSignature(rtn, AFUNPTR(wb_inv_dword),
+			IARG_PROTOTYPE, proto,
+			IARG_THREAD_ID,
+			IARG_FUNCARG_ENTRYPOINT_VALUE, 0, 
+			IARG_END);
+	}
+
+	rtn = RTN_FindByName(img, "sesc_wb_inv_dword");
+	if (RTN_Valid(rtn)) {
+		PROTO proto = PROTO_Allocate( PIN_PARG(void), CALLINGSTD_DEFAULT,
+			"wb_inv_dword", PIN_PARG(unsigned long), PIN_PARG_END() );
+		RTN_ReplaceSignature(rtn, AFUNPTR(wb_inv_dword),
+			IARG_PROTOTYPE, proto,
+			IARG_THREAD_ID,
+			IARG_FUNCARG_ENTRYPOINT_VALUE, 0, 
+			IARG_END);
+	}
+
+	rtn = RTN_FindByName(img, "_Z17sesc_wb_inv_dwordPv");
+	if (RTN_Valid(rtn)) {
+		PROTO proto = PROTO_Allocate( PIN_PARG(void), CALLINGSTD_DEFAULT,
+			"wb_inv_dword", PIN_PARG(unsigned long), PIN_PARG_END() );
+		RTN_ReplaceSignature(rtn, AFUNPTR(wb_inv_dword),
+			IARG_PROTOTYPE, proto,
+			IARG_THREAD_ID,
+			IARG_FUNCARG_ENTRYPOINT_VALUE, 0, 
+			IARG_END);
+	}
+
 	rtn = RTN_FindByName(img, "wb_inv_qword");
+	if (RTN_Valid(rtn)) {
+		PROTO proto = PROTO_Allocate( PIN_PARG(void), CALLINGSTD_DEFAULT,
+			"wb_inv_qword", PIN_PARG(unsigned long), PIN_PARG_END() );
+		RTN_ReplaceSignature(rtn, AFUNPTR(wb_inv_qword),
+			IARG_PROTOTYPE, proto,
+			IARG_THREAD_ID,
+			IARG_FUNCARG_ENTRYPOINT_VALUE, 0, 
+			IARG_END);
+	}
+
+	rtn = RTN_FindByName(img, "_Z12wb_inv_qwordPv");
+	if (RTN_Valid(rtn)) {
+		PROTO proto = PROTO_Allocate( PIN_PARG(void), CALLINGSTD_DEFAULT,
+			"wb_inv_qword", PIN_PARG(unsigned long), PIN_PARG_END() );
+		RTN_ReplaceSignature(rtn, AFUNPTR(wb_inv_qword),
+			IARG_PROTOTYPE, proto,
+			IARG_THREAD_ID,
+			IARG_FUNCARG_ENTRYPOINT_VALUE, 0, 
+			IARG_END);
+	}
+
+	rtn = RTN_FindByName(img, "sesc_wb_inv_qword");
+	if (RTN_Valid(rtn)) {
+		PROTO proto = PROTO_Allocate( PIN_PARG(void), CALLINGSTD_DEFAULT,
+			"wb_inv_qword", PIN_PARG(unsigned long), PIN_PARG_END() );
+		RTN_ReplaceSignature(rtn, AFUNPTR(wb_inv_qword),
+			IARG_PROTOTYPE, proto,
+			IARG_THREAD_ID,
+			IARG_FUNCARG_ENTRYPOINT_VALUE, 0, 
+			IARG_END);
+	}
+
+	rtn = RTN_FindByName(img, "_Z17sesc_wb_inv_qwordPv");
 	if (RTN_Valid(rtn)) {
 		PROTO proto = PROTO_Allocate( PIN_PARG(void), CALLINGSTD_DEFAULT,
 			"wb_inv_qword", PIN_PARG(unsigned long), PIN_PARG_END() );
@@ -3296,6 +3662,42 @@ VOID ImageLoad(IMG img, VOID *v)
 			IARG_END);
 	}
 
+	rtn = RTN_FindByName(img, "_Z12wb_inv_rangePvi");
+	if (RTN_Valid(rtn)) {
+		PROTO proto = PROTO_Allocate( PIN_PARG(void), CALLINGSTD_DEFAULT,
+			"wb_inv_range", PIN_PARG(unsigned long), PIN_PARG(int), PIN_PARG_END() );
+		RTN_ReplaceSignature(rtn, AFUNPTR(wb_inv_range),
+			IARG_PROTOTYPE, proto,
+			IARG_THREAD_ID,
+			IARG_FUNCARG_ENTRYPOINT_VALUE, 0, 
+			IARG_FUNCARG_ENTRYPOINT_VALUE, 1, 
+			IARG_END);
+	}
+
+	rtn = RTN_FindByName(img, "sesc_wb_inv_range");
+	if (RTN_Valid(rtn)) {
+		PROTO proto = PROTO_Allocate( PIN_PARG(void), CALLINGSTD_DEFAULT,
+			"wb_inv_range", PIN_PARG(unsigned long), PIN_PARG(int), PIN_PARG_END() );
+		RTN_ReplaceSignature(rtn, AFUNPTR(wb_inv_range),
+			IARG_PROTOTYPE, proto,
+			IARG_THREAD_ID,
+			IARG_FUNCARG_ENTRYPOINT_VALUE, 0, 
+			IARG_FUNCARG_ENTRYPOINT_VALUE, 1, 
+			IARG_END);
+	}
+
+	rtn = RTN_FindByName(img, "_Z17sesc_wb_inv_rangePvi");
+	if (RTN_Valid(rtn)) {
+		PROTO proto = PROTO_Allocate( PIN_PARG(void), CALLINGSTD_DEFAULT,
+			"wb_inv_range", PIN_PARG(unsigned long), PIN_PARG(int), PIN_PARG_END() );
+		RTN_ReplaceSignature(rtn, AFUNPTR(wb_inv_range),
+			IARG_PROTOTYPE, proto,
+			IARG_THREAD_ID,
+			IARG_FUNCARG_ENTRYPOINT_VALUE, 0, 
+			IARG_FUNCARG_ENTRYPOINT_VALUE, 1, 
+			IARG_END);
+	}
+
 	rtn = RTN_FindByName(img, "wb_inv_all");
 	if (RTN_Valid(rtn)) {
 		PROTO proto = PROTO_Allocate( PIN_PARG(void), CALLINGSTD_DEFAULT,
@@ -3306,7 +3708,35 @@ VOID ImageLoad(IMG img, VOID *v)
 			IARG_END);
 	}
 
-	// [TODO] no C++ mangled name for wb_inv_all, yet
+	rtn = RTN_FindByName(img, "_Z10wb_inv_allv");
+	if (RTN_Valid(rtn)) {
+		PROTO proto = PROTO_Allocate( PIN_PARG(void), CALLINGSTD_DEFAULT,
+			"wb_inv_all", PIN_PARG_END() );
+		RTN_ReplaceSignature(rtn, AFUNPTR(wb_inv_all),
+			IARG_PROTOTYPE, proto,
+			IARG_THREAD_ID,
+			IARG_END);
+	}
+
+	rtn = RTN_FindByName(img, "sesc_wb_inv_all");
+	if (RTN_Valid(rtn)) {
+		PROTO proto = PROTO_Allocate( PIN_PARG(void), CALLINGSTD_DEFAULT,
+			"wb_inv_all", PIN_PARG_END() );
+		RTN_ReplaceSignature(rtn, AFUNPTR(wb_inv_all),
+			IARG_PROTOTYPE, proto,
+			IARG_THREAD_ID,
+			IARG_END);
+	}
+
+	rtn = RTN_FindByName(img, "_Z15sesc_wb_inv_allv");
+	if (RTN_Valid(rtn)) {
+		PROTO proto = PROTO_Allocate( PIN_PARG(void), CALLINGSTD_DEFAULT,
+			"wb_inv_all", PIN_PARG_END() );
+		RTN_ReplaceSignature(rtn, AFUNPTR(wb_inv_all),
+			IARG_PROTOTYPE, proto,
+			IARG_THREAD_ID,
+			IARG_END);
+	}
 
 	rtn = RTN_FindByName(img, "wb_inv_master_all");
 	if (RTN_Valid(rtn)) {
@@ -3317,6 +3747,37 @@ VOID ImageLoad(IMG img, VOID *v)
 			IARG_THREAD_ID,
 			IARG_END);
 	}
+
+	rtn = RTN_FindByName(img, "_Z17wb_inv_master_allv");
+	if (RTN_Valid(rtn)) {
+		PROTO proto = PROTO_Allocate( PIN_PARG(void), CALLINGSTD_DEFAULT,
+			"wb_inv_master_all", PIN_PARG_END() );
+		RTN_ReplaceSignature(rtn, AFUNPTR(wb_inv_master_all),
+			IARG_PROTOTYPE, proto,
+			IARG_THREAD_ID,
+			IARG_END);
+	}
+
+	rtn = RTN_FindByName(img, "sesc_wb_inv_master_all");
+	if (RTN_Valid(rtn)) {
+		PROTO proto = PROTO_Allocate( PIN_PARG(void), CALLINGSTD_DEFAULT,
+			"wb_inv_master_all", PIN_PARG_END() );
+		RTN_ReplaceSignature(rtn, AFUNPTR(wb_inv_master_all),
+			IARG_PROTOTYPE, proto,
+			IARG_THREAD_ID,
+			IARG_END);
+	}
+
+	rtn = RTN_FindByName(img, "_Z22sesc_wb_inv_master_allv");
+	if (RTN_Valid(rtn)) {
+		PROTO proto = PROTO_Allocate( PIN_PARG(void), CALLINGSTD_DEFAULT,
+			"wb_inv_master_all", PIN_PARG_END() );
+		RTN_ReplaceSignature(rtn, AFUNPTR(wb_inv_master_all),
+			IARG_PROTOTYPE, proto,
+			IARG_THREAD_ID,
+			IARG_END);
+	}
+
 
 	// Bypass
 	rtn = RTN_FindByName(img, "ld_bypass");
@@ -3872,6 +4333,7 @@ void CheckBarrierResultBefore(THREADID tid)
 	//ReleaseLock(&Lock);
 }
 
+
 void CheckBarrierResultBeforeGOMPImplicit(THREADID tid)
 {
 	// temp, windy
@@ -4011,7 +4473,7 @@ VOID Routine(RTN rtn, VOID *v)
 //	Functions for Instruction Instrumentation
 //-------------------------------------------------------------------
 
-VOID ReadsMemBefore (ADDRINT applicationIp, THREADID tid, ADDRINT memoryAddressRead, UINT32 memoryReadSize)
+VOID ReadsMemBefore (ADDRINT applicationIp, THREADID tid, ADDRINT memoryAddressRead, UINT32 memoryReadSize, ADDRINT sp)
 {
 	ADDRINT startWordAddress;
 	//, endWordAddress, startOffset;
@@ -4031,7 +4493,16 @@ VOID ReadsMemBefore (ADDRINT applicationIp, THREADID tid, ADDRINT memoryAddressR
 	if (CheckEnabled == false)
 		return;
 
+	if (sp != 0)
+		StackPointer[tid] = sp;
+
+	if (memoryAddressRead <= StackBase[tid] && memoryAddressRead >= StackPointer[tid])
+		// read access for local stack address
+		return; 
+
 	//Logger.ext_debug("Global 0x6064a0 %d %d", (* (bitVectorForGlobalVariable(0x6064a0)) )[tid*2], (* (bitVectorForGlobalVariable(0x6064a0)) )[tid*2+1]);
+
+	return ;
 
 	GetLock(&Lock, tid+1);
 	//Logger.ext_debug("check %s", (bitVectorForGlobalVariable(0x6064a0))->to_string().c_str());
@@ -4069,9 +4540,12 @@ VOID ReadsMemBefore (ADDRINT applicationIp, THREADID tid, ADDRINT memoryAddressR
 					 (* (MATracker.bitVector(a)) )[j*2+1] == 0 ) {
 					int col, line;
 					string filename;
-					PIN_LockClient();
-					PIN_GetSourceLocation(applicationIp, &col, &line, &filename);
-					PIN_UnlockClient();
+
+					if (SrcReadTracking) {
+						PIN_LockClient();
+						PIN_GetSourceLocation(applicationIp, &col, &line, &filename);
+						PIN_UnlockClient();
+					}
 
 					// previously error, but this is not an error.
 					// guess this is set as an error for checking functionality.
@@ -4100,9 +4574,11 @@ VOID ReadsMemBefore (ADDRINT applicationIp, THREADID tid, ADDRINT memoryAddressR
 					// for allocation code
 					//struct sourceLocation *s;
 					//s = MATracker.getSource(a);
-					PIN_LockClient();
-					PIN_GetSourceLocation(applicationIp, &col, &line, &filename);
-					PIN_UnlockClient();
+					if (SrcReadTracking) {
+						PIN_LockClient();
+						PIN_GetSourceLocation(applicationIp, &col, &line, &filename);
+						PIN_UnlockClient();
+					}
 
 					// means 'need invalidation'
 					Logger.error("[tid: %d] read without invalidation: addr=0x%lx, %s (offset %ld 0x%lx), read at line %d file %s", tid, a, MATracker.getVariableName(a).c_str(), MATracker.getOffset(a), MATracker.getOffset(a), line, filename.c_str());
@@ -4150,9 +4626,12 @@ VOID ReadsMemBefore (ADDRINT applicationIp, THREADID tid, ADDRINT memoryAddressR
 					 (* (bitVectorForGlobalVariable(a)) )[j*2+1] == 0 ) {
 					int col, line;
 					string filename;
-					PIN_LockClient();
-					PIN_GetSourceLocation(applicationIp, &col, &line, &filename);
-					PIN_UnlockClient();
+
+					if (SrcReadTracking) {
+						PIN_LockClient();
+						PIN_GetSourceLocation(applicationIp, &col, &line, &filename);
+						PIN_UnlockClient();
+					}
 
 					// previously error, but this is not an error.
 					// guess this is set as an error for checking functionality.
@@ -4178,9 +4657,12 @@ VOID ReadsMemBefore (ADDRINT applicationIp, THREADID tid, ADDRINT memoryAddressR
 
 					int col, line;
 					string filename;
-					PIN_LockClient();
-					PIN_GetSourceLocation(applicationIp, &col, &line, &filename);
-					PIN_UnlockClient();
+
+					if (SrcReadTracking) {
+						PIN_LockClient();
+						PIN_GetSourceLocation(applicationIp, &col, &line, &filename);
+						PIN_UnlockClient();
+					}
 
 					// means 'need invalidation'
 					Logger.error("[tid: %d] read without invalidation: addr=0x%lx, %s (offset %ld 0x%lx), read at line %d file %s", tid, a, getGlobalVariableName(a), offsetInGlobalVariable(a), offsetInGlobalVariable(a), line, filename.c_str());
@@ -4197,7 +4679,7 @@ VOID ReadsMemBefore (ADDRINT applicationIp, THREADID tid, ADDRINT memoryAddressR
 }
 
 
-VOID WritesMemBefore(ADDRINT applicationIp, THREADID tid, ADDRINT memoryAddressWrite, UINT32 memoryWriteSize)
+VOID WritesMemBefore(ADDRINT applicationIp, THREADID tid, ADDRINT memoryAddressWrite, UINT32 memoryWriteSize, ADDRINT sp)
 {
 	ADDRINT startWordAddress;
 	//, endWordAddress, startOffset;
@@ -4219,6 +4701,14 @@ VOID WritesMemBefore(ADDRINT applicationIp, THREADID tid, ADDRINT memoryAddressW
 		if (AfterAlloc[tid] == false)
 			return;
 	}
+
+	if (sp != 0)
+		StackPointer[tid] = sp;
+
+	if (memoryAddressWrite <= StackBase[tid] && memoryAddressWrite >= StackPointer[tid])
+		// read access for local stack address
+		return;
+
 
 	INT32	col, line;
 	string	filename;
@@ -4305,7 +4795,9 @@ VOID WritesMemBefore(ADDRINT applicationIp, THREADID tid, ADDRINT memoryAddressW
 			if ( (* (MATracker.bitVector(a)) )[tid*2] == 1) {
 				if ( (* (MATracker.bitVector(a)) )[tid*2+1] == 1) {
 					// means 'need invalidation'
-					Logger.warn("[tid: %d] write without invalidation: %s (addr: 0x%lx, base 0x%lx offset %ld 0x%lx)", tid, MATracker.getVariableName(a).c_str(), a, MATracker.getBase(a), MATracker.getOffset(a), MATracker.getOffset(a));
+					//Logger.warn("[tid: %d] write without invalidation: %s (addr: 0x%lx, base 0x%lx offset %ld 0x%lx)", tid, MATracker.getVariableName(a).c_str(), a, MATracker.getBase(a), MATracker.getOffset(a), MATracker.getOffset(a));
+					Logger.warn("[tid: %d] write without invalidation: addr=0x%lx, %s (offset %ld 0x%lx), read at line %d file %s", tid, a, MATracker.getVariableName(a).c_str(), MATracker.getOffset(a), MATracker.getOffset(a), line, filename.c_str());
+
 				}
 			}
 			else if ( (* (MATracker.bitVector(a)) )[tid*2+1] == 0) {
@@ -4408,6 +4900,7 @@ VOID WritesMemBefore(ADDRINT applicationIp, THREADID tid, ADDRINT memoryAddressW
 
 	}	// if (CheckEnabled)
 
+
 	if (AfterAlloc[tid]) {
 		// Standard library malloc returns pointer to the variable in rax.
 		// So, I guess the first write instruction with rax after malloc call has the pointer assignment.
@@ -4505,6 +4998,7 @@ VOID Instruction(INS ins, void * v)
 					IARG_THREAD_ID,
 					IARG_MEMORYOP_EA, memOp,
 					IARG_MEMORYREAD_SIZE,
+					IARG_REG_VALUE, REG_STACK_PTR,
 					IARG_END);
 		}
 
@@ -4518,6 +5012,7 @@ VOID Instruction(INS ins, void * v)
 					IARG_THREAD_ID, 
 					IARG_MEMORYOP_EA, memOp,
 					IARG_MEMORYWRITE_SIZE,
+					IARG_REG_VALUE, REG_STACK_PTR,
 					IARG_END);
 		}
 	}	// end of for loop, memOp
@@ -4540,6 +5035,9 @@ VOID ThreadStart(THREADID tid, CONTEXT *ctxt, INT32 flags, VOID *V)
 	NumThreads++;
 	if (MaxThreads < NumThreads)
 		MaxThreads = NumThreads;
+
+	// Stack Base address
+	StackBase[tid] = PIN_GetContextReg(ctxt, REG_STACK_PTR);
 	
 	if (NumThreads == 2) {
 		// if first thread spawning, we need to check current writeback status.
@@ -4876,6 +5374,20 @@ VOID ReadConfigurationFile(const char *filename)
 			str = strtok(NULL, "=\n\t ");
 			if (!strcasecmp(str, "true")) {
 				SrcWriteTracking = true;
+			}
+		}
+
+		if (!strcasecmp(str, "src_read_tracking")) {
+			str = strtok(NULL, "=\n\t ");
+			if (!strcasecmp(str, "true")) {
+				SrcReadTracking = true;
+			}
+		}
+
+		if (!strcasecmp(str, "check_enabled")) {
+			str = strtok(NULL, "=\n\t ");
+			if (!strcasecmp(str, "false")) {
+				CheckEnabled = false;
 			}
 		}
 	}

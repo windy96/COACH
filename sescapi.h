@@ -7,40 +7,40 @@
 
 
 //	Invalidation
-void	inv_word(void *addr);
-void	inv_dword(void *addr);
-void	inv_qword(void *addr);
-void	inv_range(void *addr, int size);
-void	inv_all();
-void	inv_master_all();
+void	sesc_inv_word(void *addr);
+void	sesc_inv_dword(void *addr);
+void	sesc_inv_qword(void *addr);
+void	sesc_inv_range(void *addr, int size);
+void	sesc_inv_all();
+void	sesc_inv_master_all();
 
 //	Writeback
-void	wb_word(void *addr);
-void	wb_dword(void *addr);
-void	wb_qword(void *addr);
-void	wb_range(void *addr, int size);
-void	wb_all();
-void	wb_master_all();
+void	sesc_wb_word(void *addr);
+void	sesc_wb_dword(void *addr);
+void	sesc_wb_qword(void *addr);
+void	sesc_wb_range(void *addr, int size);
+void	sesc_wb_all();
+void	sesc_wb_master_all();
 
 //	Writeback & Invalidation
-void	wb_inv_word(void *addr);
-void	wb_inv_dword(void *addr);
-void	wb_inv_qword(void *addr);
-void	wb_inv_range(void *addr, int size);
-void	wb_inv_all();
-void	wb_inv_master_all();
+void	sesc_wb_inv_word(void *addr);
+void	sesc_wb_inv_dword(void *addr);
+void	sesc_wb_inv_qword(void *addr);
+void	sesc_wb_inv_range(void *addr, int size);
+void	sesc_wb_inv_all();
+void	sesc_wb_inv_master_all();
 
 //	Load/Store Bypass
-int 	ld_w_bypass(void *addr);
-void	st_w_bypass(void *addr, int value);
+int 	sesc_ld_w_bypass(void *addr);
+void	sesc_st_w_bypass(void *addr, int value);
 
 //	[TODO] Writeback Reserve function is not implemented yet.
 //	Still in investigation.
-void	wb_reserve(void *addr, int size);
+void	sesc_wb_reserve(void *addr, int size);
 
 //	[TODO] Writefirst function is not implemented yet.
 //	Still in investigation.
-void	wr_first(void *addr, int size);
+void	sesc_wr_first(void *addr, int size);
 
 //	Memory Allocation
 void *malloc_pmc(size_t size) __attribute__((noinline));
