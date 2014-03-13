@@ -371,6 +371,9 @@ private:
 	map<ADDRINT, int>			addrMap;
 	map<ADDRINT, int>::iterator	it;
 
+	vector< pair<ADDRINT, int> >			addrVec;
+	vector< pair<ADDRINT, int> >::iterator 	it2;
+
 	map<ADDRINT, bitset<MAX_STATES>* >				stateMap;
 	map<ADDRINT, bitset<MAX_STATES>* >::iterator	stateIt;
 
@@ -393,6 +396,7 @@ public:
 	MallocTracker() 
 	{
 		addrMap.clear(); 
+		addrVec.clear();
 		sourceMap.clear();
 		prevAddr = 0;
 		prevSize = 0;
@@ -426,6 +430,7 @@ public:
 		}
 
 		addrMap[addr] = size;
+		addrVec.push_back(make_pair(addr, size));
 		prevAddr = addr;
 		prevSize = size;
 
@@ -479,6 +484,45 @@ public:
 		return false;
 	}
 
+
+	// to check if addr is within currently allocated memory area
+	bool contain2(ADDRINT addr)
+	{
+		for (it2 = addrVec.begin(); it2 != addrVec.end(); it2++)
+		{
+			ADDRINT	startAddr, endAddr;
+
+			startAddr = (*it2).first;
+			endAddr = startAddr + (*it2).second;
+
+			if (startAddr <= addr) {
+				if (endAddr > addr)
+					return true;
+			}
+		}
+		return false;
+	}
+
+
+	INT32 containIndex(ADDRINT addr)
+	{
+		INT32	i = 0;
+		for (it2 = addrVec.begin(); it2 != addrVec.end(); it2++)
+		{
+			ADDRINT	startAddr, endAddr;
+
+			startAddr = (*it2).first;
+			endAddr = startAddr + (*it2).second;
+
+			if (startAddr <= addr) {
+				if (endAddr > addr)
+					return i;
+			}
+			i++;
+		}
+		return -1;
+	}
+
 	// to provide an offset inside the variable for the given address
 	// It is recommended to call getBase with real address which passes contain().
 	ADDRINT getBase(ADDRINT addr)
@@ -521,6 +565,21 @@ public:
 		return -1;
 	}
 
+
+	ADDRINT getOffsetIndex(ADDRINT addr, INT32 index)
+	{
+		ADDRINT startAddr, endAddr;
+		startAddr = addrVec[index].first;
+		endAddr = startAddr + addrVec[index].second;
+
+		if (startAddr <= addr) {
+			if (endAddr > addr)
+				return addr = startAddr;
+		}
+		return -1;
+	}
+
+
 	bitset<MAX_STATES>* bitVector(ADDRINT addr)
 	{
 		ADDRINT	startAddr, endAddr;
@@ -547,6 +606,17 @@ public:
 
 		return &( ( (stateMap[startAddr]) )[(addr - startAddr) / 4] );
 	}
+
+
+	bitset<MAX_STATES>* bitVectorIndex(ADDRINT addr, INT32 index)
+	{
+		ADDRINT	startAddr, endAddr;
+
+		startAddr = addrVec[index].first;
+		endAddr = startAddr + addrVec[index].second;
+		return &( ( (stateMap[startAddr]) )[(addr - startAddr) / 4] );
+	}
+
 
 	void inv_all_for_thread(int tid)
 	{
@@ -4728,13 +4798,18 @@ VOID WritesMemBefore(ADDRINT applicationIp, THREADID tid, ADDRINT memoryAddressW
 	if (CheckEnabled) {
 
 	// For memory-allocated address, written words should be recorded.
-	if (MATracker.contain(memoryAddressWrite)) {
+	//if (MATracker.contain(memoryAddressWrite)) {
+	//if (MATracker.contain2(memoryAddressWrite)) {
+	INT32	index;
+	index = MATracker.containIndex(memoryAddressWrite);
+	if (index >= 0) {
 		// File trace is disabled for now.
 		//GetLock(&Lock, tid+1);
 		//fprintf(Trace, "[tid: %d] %d Write address = 0x%lx\n", tid, BarrierCount, memoryAddressWrite);
 		//fflush(Trace);
 		NumWrites[tid].count++;
 		//ReleaseLock(&Lock);
+//		goto HERE;
 
 		//Logger.log("[tid: %d] epoch: %d Write address = 0x%lx for alloc",
 		//	tid, BarrierCount, memoryAddressWrite);
@@ -4792,6 +4867,8 @@ VOID WritesMemBefore(ADDRINT applicationIp, THREADID tid, ADDRINT memoryAddressW
 
 			// Checking if this is the latest word
 			// However, for writes, this may not be required.
+
+			/*
 			if ( (* (MATracker.bitVector(a)) )[tid*2] == 1) {
 				if ( (* (MATracker.bitVector(a)) )[tid*2+1] == 1) {
 					// means 'need invalidation'
@@ -4811,6 +4888,31 @@ VOID WritesMemBefore(ADDRINT applicationIp, THREADID tid, ADDRINT memoryAddressW
 				Logger.ext_debug("write at read valid state");
 				(* (MATracker.bitVector(a)) )[tid*2] = 1;
 				(* (MATracker.bitVector(a)) )[tid*2+1] = 0;
+			}
+			*/
+
+
+			bitset<MAX_STATES>* bv;
+			bv = MATracker.bitVectorIndex(a, index);
+			if ( (*bv)[tid*2] == 1) {
+				if ((*bv)[tid*2+1] == 1) {
+					// means 'need invalidation'
+					//Logger.warn("[tid: %d] write without invalidation: %s (addr: 0x%lx, base 0x%lx offset %ld 0x%lx)", tid, MATracker.getVariableName(a).c_str(), a, MATracker.getBase(a), MATracker.getOffset(a), MATracker.getOffset(a));
+					Logger.warn("[tid: %d] write without invalidation: addr=0x%lx, %s (offset %ld 0x%lx), read at line %d file %s", tid, a, MATracker.getVariableName(a).c_str(), MATracker.getOffsetIndex(a, index), MATracker.getOffsetIndex(a, index), line, filename.c_str());
+
+				}
+			}
+			else if ( (*bv)[tid*2+1] == 0) {
+				// means currently invalid state
+				Logger.ext_debug("write at unloaded state");
+				(* bv )[tid*2] = 1;
+				(* bv )[tid*2+1] = 0;
+			}
+			else if ( (* bv )[tid*2+1] == 1) {
+				// means currently read valid state
+				Logger.ext_debug("write at read valid state");
+				(* bv )[tid*2] = 1;
+				(* bv )[tid*2+1] = 0;
 			}
 		}
 
@@ -4900,7 +5002,7 @@ VOID WritesMemBefore(ADDRINT applicationIp, THREADID tid, ADDRINT memoryAddressW
 
 	}	// if (CheckEnabled)
 
-
+//HERE:
 	if (AfterAlloc[tid]) {
 		// Standard library malloc returns pointer to the variable in rax.
 		// So, I guess the first write instruction with rax after malloc call has the pointer assignment.
@@ -5084,10 +5186,10 @@ VOID ThreadFini(THREADID tid, const CONTEXT *ctxt, INT32 flags, VOID *V)
 
 VOID FinalAnalysis()
 {
-	Logger.log("\n\n *** Final Analysis ***\n");
+	Logger.warn("\n\n *** Final Analysis ***\n");
 	// Basic read/write info per thread
 	for (int i = 0; i < MaxThreads; i++) {
-		Logger.log("tid=%d, reads=%ld, writes=%ld\n", i, NumReads[i].count, NumWrites[i].count);
+		Logger.warn("tid=%d, reads=%ld, writes=%ld\n", i, NumReads[i].count, NumWrites[i].count);
 	}
 
 
@@ -5153,7 +5255,7 @@ VOID Fini(INT32 code, VOID *v)
 {
 	// Anything required for final analysis should be written here.
 	// [FIXME] final analysis is commented out temporarilly.
-	//FinalAnalysis();
+	FinalAnalysis();
 
 	Logger.close();
 
