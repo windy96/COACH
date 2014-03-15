@@ -12,7 +12,7 @@
  *
  *	History
  *		started from Jun 3, 2012
- *		last updated on Mar 12, 2014
+ *		last updated on Mar 14, 2014
  *
  *	Author
  *		written by Kim, Wooil
@@ -141,7 +141,7 @@ public:
 
 	FILE*	getOutputFile()			{ return outputFile; }
 	void	setOutputFile(FILE* fp)	{ outputFile = fp; }
-	void	close()					{ fprintf(outputFile, "#eof\n"); fclose(outputFile); }
+	void	close()					{ fprintf(outputFile, "#eof\n"); fflush(outputFile); fclose(outputFile); }
 
 
 	void ext_debug(const char* format, ...)
@@ -360,6 +360,9 @@ struct sourceLocation
 //	Memory Allocation Tracker
 //-------------------------------------------------------------------
 
+typedef		map<ADDRINT, int>			addrMapType;
+typedef		map<ADDRINT, int>::iterator	addrMapIterator;
+
 class MallocTracker 
 {
 private:
@@ -405,6 +408,12 @@ public:
 	bool hasEntry(ADDRINT addr) { 
 		return (addrMap.find(addr) != addrMap.end()); 
 	}
+
+	bool isAddrMapEnd(addrMapIterator myIt) 
+	{
+		return (myIt == addrMap.end());
+	}
+
 
 	void add(ADDRINT addr, int size) 
 	{
@@ -524,27 +533,29 @@ public:
 	}
 
 
-	map<ADDRINT, int>::iterator containIterator(ADDRINT addr, int size)
+
+	addrMapIterator containIterator(ADDRINT addr, int size)
 	{
-		pair < map<ADDRINT, int>::iterator, bool> insertResult;
+		pair < addrMapIterator, bool> insertResult;
 		insertResult = addrMap.insert(make_pair(addr, size));
+		addrMapIterator myIt;
 
 		if (insertResult.second == true) {
 			// inserted, meaning no address was in the map
 			// either no heap address or address in the allocated range
-			it = insertResult.first;
+			myIt = insertResult.first;
 
-			if (it != addrMap.begin()) {
+			if (myIt != addrMap.begin()) {
 				// *it is not the first
 				ADDRINT		startAddr, endAddr;
 
-				it--;
-				startAddr = it->first;
-				endAddr = startAddr + it->second;
+				myIt--;
+				startAddr = myIt->first;
+				endAddr = startAddr + myIt->second;
 
 				if (endAddr > addr) {	// within the allocated range
 					addrMap.erase(insertResult.first);
-					return it;
+					return myIt;					
 				}
 				else {	// not within the allocated range
 					addrMap.erase(insertResult.first);
@@ -560,7 +571,42 @@ public:
 		else {
 			// already there. the first address of one allocated range.
 			return insertResult.first;
+			//return addrMap.end();
 		}
+	}
+
+
+	addrMapIterator containIterator2(ADDRINT addr)
+	{
+		addrMapIterator myIt;
+		myIt = addrMap.upper_bound(addr);
+
+		if (addrMap.size() == 0)
+			return addrMap.end();
+
+		if (myIt == addrMap.begin()) {
+			ADDRINT		startAddr, endAddr;
+			startAddr = myIt->first;
+			endAddr = startAddr + myIt->second;
+			if ((startAddr <= addr) && (endAddr > addr))
+				return myIt;					
+			else {	// not within the allocated range
+				return addrMap.end();
+			}
+		}
+		else {
+			ADDRINT		startAddr, endAddr;
+			myIt--;
+			startAddr = myIt->first;
+			endAddr = startAddr + myIt->second;
+			if (endAddr > addr) {	// within the allocated range
+				return myIt;					
+			}
+			else {	// not within the allocated range
+				return addrMap.end();
+			}
+		}
+
 	}
 
 
@@ -591,6 +637,19 @@ public:
 		ADDRINT startAddr, endAddr;
 		startAddr = addrVec[index].first;
 		endAddr = startAddr + addrVec[index].second;
+
+		if (startAddr <= addr) {
+			if (endAddr > addr)
+				return startAddr;
+		}
+		return -1;
+	}
+
+	ADDRINT getBaseIterator(ADDRINT addr, addrMapIterator myIt)
+	{
+		ADDRINT startAddr, endAddr;
+		startAddr = myIt->first;
+		endAddr = startAddr + myIt->second;
 
 		if (startAddr <= addr) {
 			if (endAddr > addr)
@@ -634,6 +693,19 @@ public:
 		return -1;
 	}
 
+	ADDRINT getOffsetIterator(ADDRINT addr, addrMapIterator myIt) 
+	{
+		ADDRINT startAddr, endAddr;
+		startAddr = myIt->first;
+		endAddr = startAddr + myIt->second;
+
+		if (startAddr <= addr) {
+			if (endAddr > addr)
+				return addr - startAddr;
+		}
+		Logger.error("getOffsetIterator: 0x%lx - 0x%lx", startAddr, endAddr);
+		return -1;
+	}
 
 	bitset<MAX_STATES>* bitVector(ADDRINT addr)
 	{
@@ -672,6 +744,14 @@ public:
 		return &( ( (stateMap[startAddr]) )[(addr - startAddr) / 4] );
 	}
 
+	bitset<MAX_STATES>* bitVectorIterator(ADDRINT addr, map<ADDRINT, int>::iterator myIt)
+	{
+		ADDRINT	startAddr, endAddr;
+
+		startAddr = myIt->first;
+		endAddr = startAddr + myIt->second;
+		return &( ( (stateMap[startAddr]) )[(addr - startAddr) / 4] );
+	}
 
 	void inv_all_for_thread(int tid)
 	{
@@ -698,6 +778,38 @@ public:
 					// otherwise, make it invalid
 					(* (bitVector(a)) )[tid*2  ] = 0;
 					(* (bitVector(a)) )[tid*2+1] = 0;
+				}
+			}
+		}
+	}
+
+
+	void wb_all_for_thread(int tid)
+	{
+		ADDRINT	startAddr, endAddr;
+
+		startAddr = 0;	// this is for turning off warning message.
+		for (it = addrMap.begin(); it != addrMap.end(); it++)
+		{
+			ADDRINT startWordAddress, endWordAddress;
+
+			startAddr = (*it).first;
+			endAddr = startAddr + (*it).second;
+
+			startWordAddress = startAddr & ADDR_MASK;
+			endWordAddress = endAddr & ADDR_MASK;
+
+			for (ADDRINT a = startWordAddress; a < endWordAddress; a += WORD_BYTES)
+			{
+				bitset<MAX_STATES>* bv;
+				bv = bitVectorIterator(a, it);
+				if ( (*bv)[tid*2  ] == 1 && 
+					 (*bv)[tid*2+1] == 0     ) {
+					bv->set();
+
+					// dirty -> clean
+					(* (bitVector(a)) )[tid*2  ] = 0;
+					(* (bitVector(a)) )[tid*2+1] = 1;				
 				}
 			}
 		}
@@ -795,6 +907,16 @@ public:
 		return variableNameMap[startAddr];		
 	}
 
+	string getVariableNameIterator(map<ADDRINT, int>::iterator myIt)
+	{
+		ADDRINT startAddr;
+		startAddr = myIt->first;
+		if (variableNameMap.find(startAddr) == variableNameMap.end())
+			Logger.error("0x%lx fails to find name", startAddr);
+		if (startAddr == 0)
+			return "noname";
+		return variableNameMap[startAddr];		
+	}
 };	// class MallocTracker
 
 
@@ -996,8 +1118,6 @@ BOOL			AfterAlloc[MAX_THREADS];	// if true, it is just after memory allocation f
 ADDRINT			StackBase[MAX_THREADS];
 ADDRINT			StackPointer[MAX_THREADS];
 
-//list<ADDRINT>	WrittenWordsInPrevEpoch[MAX_THREADS];
-set<ADDRINT>	WrittenWordsInPrevEpoch[MAX_THREADS];
 //list<ADDRINT>	WrittenWordsInThisEpoch[MAX_THREADS];
 set<ADDRINT>	WrittenWordsInThisEpoch[MAX_THREADS];
 //list<ADDRINT>::iterator	WrittenWordsIterator[MAX_THREADS];
@@ -1310,6 +1430,7 @@ VOID* mallocWrapper(CONTEXT *ctxt, AFUNPTR orig_function, THREADID tid, int size
 	AfterAlloc[tid] = true;
 	
 	ReleaseLock(&Lock);
+	Logger.log("after malloc");
 	return ret;
 }
 
@@ -1710,6 +1831,7 @@ void PMC_process(PMCInst function, int tid, ADDRINT addr, int size)
 			}
 			else if (MutexLocked[tid] == Unlocked) {
 
+				/*
 				for (GlobalVariableVecIterator = GlobalVariableVec.begin();
 					 GlobalVariableVecIterator != GlobalVariableVec.end();
 					 ++GlobalVariableVecIterator)
@@ -1718,8 +1840,9 @@ void PMC_process(PMCInst function, int tid, ADDRINT addr, int size)
 				}
 
 				MATracker.inv_all_for_thread(tid);
+				*/
 
-				//AutoInvForEpoch[tid] = true;
+				AutoInvForEpoch[tid] = true;
 				// will be cleared in next barrierWrapper
 				Logger.log("[tid: %d] inv all", tid);
 			}
@@ -1738,12 +1861,14 @@ void PMC_process(PMCInst function, int tid, ADDRINT addr, int size)
 				Logger.log("[tid: %d] wb all for the lock", tid);
 			}
 			else if (MutexLocked[tid] == Unlocked) {
-
 				for (WrittenWordsIterator[tid] = WrittenWordsInThisEpoch[tid].begin();
 					WrittenWordsIterator[tid] != WrittenWordsInThisEpoch[tid].end();
 					WrittenWordsIterator[tid]++)
-					PMC_coherence(function, tid, *WrittenWordsIterator[tid], 4);
-
+					PMC_coherence(function, tid, *WrittenWordsIterator[tid], 4);				
+				
+				// global variables
+				// and allocated memory
+				//MATracker.wb_all_for_thread(tid);
 				WrittenWordsInThisEpoch[tid].clear();
 				Logger.log("[tid: %d] wb all", tid);
 			}
@@ -1801,6 +1926,12 @@ void PMC_process(PMCInst function, int tid, ADDRINT addr, int size)
 				for (WrittenWordsIterator[tid] = WrittenWordsInThisEpoch[tid].begin();
 					WrittenWordsIterator[tid] != WrittenWordsInThisEpoch[tid].end();
 					WrittenWordsIterator[tid]++)
+					PMC_coherence(function, tid, *WrittenWordsIterator[tid], 4);				
+
+				/*
+				for (WrittenWordsIterator[tid] = WrittenWordsInThisEpoch[tid].begin();
+					WrittenWordsIterator[tid] != WrittenWordsInThisEpoch[tid].end();
+					WrittenWordsIterator[tid]++)
 				{
 					// for master all, written results are changed to read valid state.
 					// all other threads' states remain the same.
@@ -1820,7 +1951,8 @@ void PMC_process(PMCInst function, int tid, ADDRINT addr, int size)
 				}
 
 				WrittenWordsInThisEpoch[tid].clear();
-				Logger.log("[tid: %d] wb master all", tid);
+				*/
+				Logger.log("[tid: %d] wb master all", tid);				
 			}
 			break;
 		default:
@@ -1882,7 +2014,10 @@ void PMC_process(PMCInst function, int tid, ADDRINT addr, int size)
 			//LC[tid].cleanEntry(a);  LC[tid].removeEntry(a);  break;
 			// like writeback
 			Logger.ext_debug("writeback and invalidation starts.");
-			WrittenWordsInThisEpoch[tid].erase(a);
+			if (MutexLocked[tid] == Locked)
+				WrittenWordsInThisLock[tid].erase(a);
+			else
+				WrittenWordsInThisEpoch[tid].erase(a);
 			Logger.ext_debug("writeback and invalidation ends.");
 			break;
 
@@ -2561,10 +2696,11 @@ VOID* lockWrapper(CONTEXT *ctxt, AFUNPTR orig_function, THREADID tid, VOID* mute
 
 	GetLock(&Lock, tid+1);
 	if (MutexLocked[tid] == Locked) {
-		Logger.warn("[tid: %d] nested lock is detected", tid);
+		Logger.error("[tid: %d] nested lock is detected", tid);
 	}
-	MutexLocked[tid] = DuringLockFunc;
+	Logger.log("[tid: %d] Lock 0x%x", tid, mutex);
 	ReleaseLock(&Lock);
+	MutexLocked[tid] = DuringLockFunc;
 
 	PIN_CallApplicationFunction(ctxt, PIN_ThreadId(),
 		CALLINGSTD_DEFAULT, orig_function,
@@ -2575,9 +2711,10 @@ VOID* lockWrapper(CONTEXT *ctxt, AFUNPTR orig_function, THREADID tid, VOID* mute
 	MutexLocked[tid] = Locked;
 	MutexLock[tid] = mutex;
 
-	GetLock(&Lock, tid+1);
-	Logger.log("[tid: %d] Lock 0x%x", tid, mutex);
-	ReleaseLock(&Lock);
+	// temp windy
+	//GetLock(&Lock, tid+1);
+	//Logger.log("[tid: %d] Lock 0x%x", tid, mutex);
+	//ReleaseLock(&Lock);
 
 	return ret;
 }
@@ -2594,7 +2731,7 @@ void AnalyzeCriticalSection(int tid)
 	//list<ADDRINT>::iterator	wit;
 	set<ADDRINT>::iterator	wit;
 
-	Logger.log("[tid: %d] *** Analyzing unwritten-back writes in the critical section", tid);
+	Logger.warn("[tid: %d] *** Analyzing unwritten-back writes in the critical section", tid);
 	for (wit = WrittenWordsInThisLock[tid].begin(); wit != WrittenWordsInThisLock[tid].end(); wit++)
 	{
 		if ((*wit >= MinLockVector) && (*wit < MaxLockVector + 40)) {
@@ -2625,6 +2762,11 @@ void AnalyzeCriticalSection(int tid)
 		if (done)
 			continue;
 
+		
+
+		// temp windy
+		// this code portion makes a runtime error.
+
 		// check allocated memory
 		s2 = MATracker.getVariableName(*wit);
 		ADDRINT	allocAddr;
@@ -2645,6 +2787,7 @@ void AnalyzeCriticalSection(int tid)
 
 		if (done)
 			continue;
+		
 
 		struct sourceLocation *allocSrc = MATracker.getSource(*wit);
 		Logger.warn("0x%lx (base 0x%lx, offset 0x%x=%d, allocated at line %d file %s) is not written back.", *wit, MATracker.getBase(*wit), MATracker.getOffset(*wit), MATracker.getOffset(*wit), allocSrc->line, allocSrc->filename.c_str());
@@ -2669,9 +2812,10 @@ VOID* unlockWrapper(CONTEXT *ctxt, AFUNPTR orig_function, THREADID tid, VOID* mu
 
 	// Another checking routine is required.
 	//LockBarrierResultBefore(tid);
-	GetLock(&Lock, tid+1);
+	// temp windy
+	//GetLock(&Lock, tid+1);
 	MutexLocked[tid] = DuringLockFunc;
-	ReleaseLock(&Lock);
+	//ReleaseLock(&Lock);
 
 	PIN_CallApplicationFunction(ctxt, PIN_ThreadId(),
 		CALLINGSTD_DEFAULT, orig_function,
@@ -2681,18 +2825,20 @@ VOID* unlockWrapper(CONTEXT *ctxt, AFUNPTR orig_function, THREADID tid, VOID* mu
 
 	GetLock(&Lock, tid+1);
 	Logger.log("[tid: %d] Unlock 0x%x, segment %d", tid, MutexLock[tid], SegmentCount[tid]);
+	ReleaseLock(&Lock);
 	AutoInvForLock[tid] = false;
 	MutexLocked[tid] = Unlocked;
 	MutexLock[tid] = NULL;
-	ReleaseLock(&Lock);
+	//ReleaseLock(&Lock);
 
-	GetLock(&Lock, tid+1);
+	//GetLock(&Lock, tid+1);
 	// Another checking routine is required.
 	//CheckBarrierResultBefore(tid);
-	AnalyzeCriticalSection(tid);
+	// temp windy
+	//AnalyzeCriticalSection(tid);
 	WrittenWordsInThisLock[tid].clear();
 	SegmentCount[tid]++;
-	ReleaseLock(&Lock);
+	//ReleaseLock(&Lock);
 	return ret;
 }
 
@@ -4296,19 +4442,19 @@ VOID ImageLoad(IMG img, VOID *v)
 
 
 
+
 //-------------------------------------------------------------------
 //	Functions for Routine Instrumentation
 //-------------------------------------------------------------------
 
 void AnalyzeBarrierRegion(int tid) 
 {
-	// Report if allocated memory is written but not written back.
+	// Report if memory is written but not written back.
 
 	// source code reference for memory allocation is removed.
 	//struct sourceLocation* sl;
 	string s2;
 	vector<struct GlobalVariableStruct>::iterator	it;
-	//list<ADDRINT>::iterator	wit;
 	set<ADDRINT>::iterator	wit;
 
 	Logger.warn("[tid: %d] *** Analyzing unwritten-back writes", tid);
@@ -4438,8 +4584,6 @@ void CheckBarrierResult(THREADID tid, int ret)
 
 void CheckBarrierResultBefore(THREADID tid)
 {
-	// temp, windy
-	//GetLock(&Lock, tid+1);
 	Logger.log("[tid: %d] reached to barrier %d", tid, BarrierCount);
 
 	// phase proceeding in each thread
@@ -4461,9 +4605,6 @@ void CheckBarrierResultBefore(THREADID tid)
 		BarrierCount++;
 		CurrentBarrierArrival = 0;
 	}
-
-	// temp, windy
-	//ReleaseLock(&Lock);
 }
 
 
@@ -4616,6 +4757,8 @@ VOID ReadsMemBefore (ADDRINT applicationIp, THREADID tid, ADDRINT memoryAddressR
 	if (!MainRunning)
 		return;
 
+	// During pthread synchronization functions, we disable read/write tracking
+	// because it will access pthread-internal data structures.
 	if (DuringBarrierFunc[tid] == true)
 		return;
 	if (DuringCondFunc[tid] == true)
@@ -4633,259 +4776,170 @@ VOID ReadsMemBefore (ADDRINT applicationIp, THREADID tid, ADDRINT memoryAddressR
 		// read access for local stack address
 		return; 
 
+	// return ;
+
+	INT32	col, line;
+	string	filename;
+	col = 0; line = 0;
+	filename = "";
+
+	if (SrcWriteTracking) {
+		PIN_LockClient();
+		PIN_GetSourceLocation(applicationIp, &col, &line, &filename);
+		PIN_UnlockClient();
+	}
+
 	//Logger.ext_debug("Global 0x6064a0 %d %d", (* (bitVectorForGlobalVariable(0x6064a0)) )[tid*2], (* (bitVectorForGlobalVariable(0x6064a0)) )[tid*2+1]);
-
 	
-	//GetLock(&Lock, tid+1);
-	//Logger.ext_debug("check %s", (bitVectorForGlobalVariable(0x6064a0))->to_string().c_str());
-	// if read is from allocated memory
-	//if (MATracker.contain(memoryAddressRead)) {
-	INT32	index;
-	index = MATracker.containIndex(memoryAddressRead);
-	if (index >= 0) {
-		// File trace is disabled for now.
-		//GetLock(&Lock, tid+1);
-		//fprintf(Trace, "[tid: %d] %d Read address = 0x%lx\n", tid, BarrierCount, memoryAddressRead);
-		//fflush(Trace);
-		NumReads[tid].count++;
-		//ReleaseLock(&Lock);
 
-		if (MutexLocked[tid] == Locked)
-			Logger.ext_debug("[tid: %d] epoch: %d Locked / Read address = 0x%lx", tid, BarrierCount, memoryAddressRead);
-		else
-			Logger.ext_debug("[tid: %d] epoch: %d Read address = 0x%lx", tid, BarrierCount, memoryAddressRead);
+	if (CheckEnabled) {
+		// Now only for global/heap addresses
+		addrMapIterator myIt;
+		GetLock(&Lock, tid+1);
+		myIt = MATracker.containIterator2(memoryAddressRead);
 
+		if (MATracker.isAddrMapEnd(myIt) == false) {
+			NumReads[tid].count++;
 
-		startWordAddress = memoryAddressRead & ADDR_MASK;
-		//endWordAddress = (memoryAddressRead + memoryReadSize) & ADDR_MASK;
-		//startOffset = memoryAddressRead & offsetMask;
+			startWordAddress = memoryAddressRead & ADDR_MASK;
+			//endWordAddress = (memoryAddressRead + memoryReadSize) & ADDR_MASK;
+			//startOffset = memoryAddressRead & offsetMask;
 
-		for (ADDRINT a = startWordAddress; a < memoryAddressRead + memoryReadSize; a += WORD_BYTES)
-		{
-			// if others have dirty valid copy, 
-			// this is probably problematic. 
-			// Either
-			// i) missing writeback from others in previous epoch
-			// ii) failure to analyze OCC
-
-			bitset<MAX_STATES>* bv;
-			bv = MATracker.bitVectorIndex(a, index);
-
-			for (UINT32 j = 0; j < MAX_THREADS; j++)
+			for (ADDRINT a = startWordAddress; a < memoryAddressRead + memoryReadSize; a += WORD_BYTES)
 			{
-				if (j == tid) continue;
-				if ( (* bv )[j*2  ] == 1 &&
-					 (* bv )[j*2+1] == 0 ) {
-					int col, line;
-					string filename;
+				// if others have dirty valid copy, 
+				// this is probably problematic. 
+				// Either
+				// i) missing writeback from others in previous epoch
+				// ii) failure to analyze OCC
 
-					if (SrcReadTracking) {
-						PIN_LockClient();
-						PIN_GetSourceLocation(applicationIp, &col, &line, &filename);
-						PIN_UnlockClient();
-					}
+				bitset<MAX_STATES>* bv;
+				// bv = MATracker.bitVectorIndex(a, index);
+				bv = MATracker.bitVectorIterator(a, myIt);
 
-					// previously error, but this is not an error.
-					// guess this is set as an error for checking functionality.
-					GetLock(&Lock, tid+1);
-					Logger.error("[tid: %d] thread %d has dirty copy, but current thread tries to read with auto invalidation for address 0x%lx, name %s, base=0x%lx, offset=0x%x at line %d file %s",
-						tid, j, a, MATracker.getVariableNameIndex(index).c_str(), MATracker.getBaseIndex(a, index), MATracker.getOffsetIndex(a, index), line, filename.c_str());
-					ReleaseLock(&Lock);
-				}						
-			}
-
-			// invalidation test
-			if ( (*bv )[tid*2] == 1) {
-				if ( (* bv )[tid*2+1] == 1) {
-					if ( ((MutexLocked[tid] == Locked) && AutoInvForLock[tid]) ||
-						 ((MutexLocked[tid] == Unlocked) && AutoInvForEpoch[tid]) ) {
-					//if (AutoInvForLock[tid] || AutoInvForEpoch[tid]) {
-						// making it read valid with auto invalidation
-						GetLock(&Lock, tid+1);
-						(* bv )[tid*2  ] = 0;
-						(* bv )[tid*2+1] = 1;
-						Logger.log("[tid: %d] auto invalidated for address 0x%lx, name:%s, base=0x%lx offset=0x%x", 
-							tid, a, MATracker.getVariableNameIndex(index).c_str(), MATracker.getBaseIndex(a, index), MATracker.getOffsetIndex(a, index));
-						ReleaseLock(&Lock);
-						continue;
-					}
-
-					// Source code tracing
-					INT32	col, line;
-					string	filename;
-					// for allocation code
-					//struct sourceLocation *s;
-					//s = MATracker.getSource(a);
-					if (SrcReadTracking) {
-						PIN_LockClient();
-						PIN_GetSourceLocation(applicationIp, &col, &line, &filename);
-						PIN_UnlockClient();
-					}
-
-					// means 'need invalidation'
-					GetLock(&Lock, tid+1);
-					Logger.error("[tid: %d] read without invalidation: addr=0x%lx, %s (offset %ld 0x%lx), read at line %d file %s", tid, a, MATracker.getVariableNameIndex(index).c_str(), MATracker.getOffsetIndex(a, index), MATracker.getOffsetIndex(a, index), line, filename.c_str());
-					ReleaseLock(&Lock);
+				for (UINT32 j = 0; j < MAX_THREADS; j++)
+				{
+					if (j == tid) continue;
+					if ( (* bv )[j*2  ] == 1 &&
+						 (* bv )[j*2+1] == 0 ) {
+						// previously error, but this is not an error.
+						// guess this is set as an error for checking functionality.
+						Logger.error("[tid: %d] thread %d has dirty copy, but current thread tries to read with auto invalidation for address 0x%lx, name %s, base=0x%lx, offset=0x%x at line %d file %s",
+							//	tid, j, a, MATracker.getVariableNameIndex(index).c_str(), MATracker.getBaseIndex(a, index), MATracker.getOffsetIndex(a, index), line, filename.c_str());
+							tid, j, a, MATracker.getVariableNameIterator(myIt).c_str(), MATracker.getBaseIterator(a, myIt), MATracker.getOffsetIterator(a, myIt), line, filename.c_str());
+					}						
 				}
-				// '10' means write valid. So, no action.
-			}
-			else if ( (* bv )[tid*2+1] == 0) {
-				// means currently invalid state, 00
-				Logger.ext_debug("read at unloaded state");
-				(* bv )[tid*2+1] = 1;	// changed to read valid state
-			}
-	
-			/*
-			for (UINT32 j = 0; j < MAX_THREADS; j++)
-			{
-				if (j == tid) continue;
-				if ( (* (MATracker.bitVector(a)) )[j*2  ] == 1 &&
-					 (* (MATracker.bitVector(a)) )[j*2+1] == 0 ) {
-					int col, line;
-					string filename;
+			
 
-					if (SrcReadTracking) {
-						PIN_LockClient();
-						PIN_GetSourceLocation(applicationIp, &col, &line, &filename);
-						PIN_UnlockClient();
+				// invalidation test
+				if ( (*bv )[tid*2] == 1) {
+					if ( (* bv )[tid*2+1] == 1) {
+						if ( ((MutexLocked[tid] == Locked) && AutoInvForLock[tid]) ||
+							 ((MutexLocked[tid] == Unlocked) && AutoInvForEpoch[tid]) ) {
+						//if (AutoInvForLock[tid] || AutoInvForEpoch[tid]) {
+							// making it read valid with auto invalidation
+							(* bv )[tid*2  ] = 0;
+							(* bv )[tid*2+1] = 1;
+							/*
+							Logger.log("[tid: %d] auto invalidated for address 0x%lx, name:%s, base=0x%lx offset=0x%x", 
+								//tid, a, MATracker.getVariableNameIndex(index).c_str(), MATracker.getBaseIndex(a, index), MATracker.getOffsetIndex(a, index));
+								tid, a, MATracker.getVariableNameIterator(myIt).c_str(), MATracker.getBaseIterator(a, myIt), MATracker.getOffsetIterator(a, myIt));
+							*/
+							continue;
+						}
+
+
+						// means 'need invalidation'
+						//GetLock(&Lock, tid+1);
+						//Logger.error("[tid: %d] read without invalidation: addr=0x%lx, %s (offset %ld 0x%lx), read at line %d file %s", tid, a, MATracker.getVariableNameIndex(index).c_str(), MATracker.getOffsetIndex(a, index), MATracker.getOffsetIndex(a, index), line, filename.c_str());
+						Logger.error("[tid: %d] read without invalidation: addr=0x%lx, %s (offset %ld 0x%lx), read at line %d file %s", tid, a, MATracker.getVariableNameIterator(myIt).c_str(), MATracker.getOffsetIterator(a, myIt), MATracker.getOffsetIterator(a, myIt), line, filename.c_str());
+						//ReleaseLock(&Lock);
 					}
-
-					// previously error, but this is not an error.
-					// guess this is set as an error for checking functionality.
-					Logger.error("[tid: %d] thread %d has dirty copy, but current thread tries to read with auto invalidation for address 0x%lx, name %s, base=0x%lx, offset=0x%x at line %d file %s",
-						tid, j, a, MATracker.getVariableName(a).c_str(), MATracker.getBase(a), MATracker.getOffset(a), line, filename.c_str());
-				}						
-			}
-
-			// invalidation test
-			if ( (* (MATracker.bitVector(a)) )[tid*2] == 1) {
-				if ( (* (MATracker.bitVector(a)) )[tid*2+1] == 1) {
-					if ( ((MutexLocked[tid] == Locked) && AutoInvForLock[tid]) ||
-						 ((MutexLocked[tid] == Unlocked) && AutoInvForEpoch[tid]) ) {
-					//if (AutoInvForLock[tid] || AutoInvForEpoch[tid]) {
-						// making it read valid with auto invalidation
-						(* (MATracker.bitVector(a)) )[tid*2  ] = 0;
-						(* (MATracker.bitVector(a)) )[tid*2+1] = 1;
-						Logger.log("[tid: %d] auto invalidated for address 0x%lx, name:%s, base=0x%lx offset=0x%x", 
-							tid, a, MATracker.getVariableName(a).c_str(), MATracker.getBase(a), MATracker.getOffset(a));
-						continue;
-					}
-
-					// Source code tracing
-					INT32	col, line;
-					string	filename;
-					// for allocation code
-					//struct sourceLocation *s;
-					//s = MATracker.getSource(a);
-					if (SrcReadTracking) {
-						PIN_LockClient();
-						PIN_GetSourceLocation(applicationIp, &col, &line, &filename);
-						PIN_UnlockClient();
-					}
-
-					// means 'need invalidation'
-					Logger.error("[tid: %d] read without invalidation: addr=0x%lx, %s (offset %ld 0x%lx), read at line %d file %s", tid, a, MATracker.getVariableName(a).c_str(), MATracker.getOffset(a), MATracker.getOffset(a), line, filename.c_str());
+					// '10' means write valid. So, no action.
 				}
-				// '10' means write valid. So, no action.
+				else if ( (* bv )[tid*2+1] == 0) {
+					// means currently invalid state, 00
+					Logger.ext_debug("read at unloaded state");
+					(* bv )[tid*2+1] = 1;	// changed to read valid state
+				}
 			}
-			else if ( (* (MATracker.bitVector(a)) )[tid*2+1] == 0) {
-				// means currently invalid state, 00
-				Logger.ext_debug("read at unloaded state");
-				(* (MATracker.bitVector(a)) )[tid*2+1] = 1;	// changed to read valid state
-			}
-			*/
+			ReleaseLock(&Lock);
 		}
-	}
-	// else if read is from global memory
-	else if (isGlobalVariable(memoryAddressRead)) {
-		// File trace is disabled for now.
-		//fprintf(Trace, "[tid: %d] %d Read address = 0x%lx\n", tid, BarrierCount, memoryAddressRead);
-		//fflush(Trace);
-		NumReads[tid].count++;
-		//ReleaseLock(&Lock);
+		else if (isGlobalVariable(memoryAddressRead)) {
+			// else if read is from global memory
+			ReleaseLock(&Lock);
+			NumReads[tid].count++;
 
-		if (MutexLocked[tid] == Locked)
-			Logger.ext_debug("[tid: %d] epoch: %d Locked / Read address = 0x%lx", tid, BarrierCount, memoryAddressRead);
-		else
-			Logger.ext_debug("[tid: %d] epoch: %d Read address = 0x%lx", tid, BarrierCount, memoryAddressRead);
+			// commented out for potential overhead
+			//if (MutexLocked[tid] == Locked)
+			//	Logger.ext_debug("[tid: %d] epoch: %d Locked / Read address = 0x%lx", tid, BarrierCount, memoryAddressRead);
+			//else
+			//	Logger.ext_debug("[tid: %d] epoch: %d Read address = 0x%lx", tid, BarrierCount, memoryAddressRead);
 
 
-		startWordAddress = memoryAddressRead & ADDR_MASK;
-		//endWordAddress = (memoryAddressRead + memoryReadSize) & ADDR_MASK;
-		//startOffset = memoryAddressRead & offsetMask;
+			startWordAddress = memoryAddressRead & ADDR_MASK;
+			//endWordAddress = (memoryAddressRead + memoryReadSize) & ADDR_MASK;
+			//startOffset = memoryAddressRead & offsetMask;
 
-		for (ADDRINT a = startWordAddress; a < memoryAddressRead + memoryReadSize; a += WORD_BYTES)
-		{
+			for (ADDRINT a = startWordAddress; a < memoryAddressRead + memoryReadSize; a += WORD_BYTES)
+			{
 				//	Logger.warn("[tid: %d] read : %s, %lx", tid, getGlobalVariableName(a), a);
-			// if others have dirty valid copy, 
-			// this is probably problematic. 
-			// Either
-			// i) missing writeback from others in previous epoch
-			// ii) failure to analyze OCC
+				// if others have dirty valid copy, 
+				// this is probably problematic. 
+				// Either
+				// i) missing writeback from others in previous epoch
+				// ii) failure to analyze OCC
 
-			for (UINT32 j = 0; j < MAX_THREADS; j++)
-			{
-				if (j == tid) continue;
-				if ( (* (bitVectorForGlobalVariable(a)) )[j*2  ] == 1 &&
-					 (* (bitVectorForGlobalVariable(a)) )[j*2+1] == 0 ) {
-					int col, line;
-					string filename;
+				for (UINT32 j = 0; j < MAX_THREADS; j++)
+				{
+					if (j == tid) continue;
+					if ( (* (bitVectorForGlobalVariable(a)) )[j*2  ] == 1 &&
+						 (* (bitVectorForGlobalVariable(a)) )[j*2+1] == 0 ) {
 
-					if (SrcReadTracking) {
-						PIN_LockClient();
-						PIN_GetSourceLocation(applicationIp, &col, &line, &filename);
-						PIN_UnlockClient();
-					}
-
-					// previously error, but this is not an error.
-					// guess this is set as an error for checking functionality.
-					GetLock(&Lock, tid+1);
-					Logger.error("[tid: %d] thread %d has dirty copy, but current thread tries to read with auto invalidation for address 0x%lx, name %s, base=0x%lx, offset=0x%x at line %d file %s",
-						tid, j, a, getGlobalVariableName(a), baseInGlobalVariable(a), offsetInGlobalVariable(a), line, filename.c_str());
-					ReleaseLock(&Lock);
-				}						
-			}
-
-			// invalidation test
-			if ( (* (bitVectorForGlobalVariable(a)) )[tid*2] == 1) {
-				if ( (* (bitVectorForGlobalVariable(a)) )[tid*2+1] == 1) {
-
-					if ( ((MutexLocked[tid] == Locked) && AutoInvForLock[tid]) ||
-						 ((MutexLocked[tid] == Unlocked) && AutoInvForEpoch[tid]) ) {
-					//if (AutoInvForLock[tid] || AutoInvForEpoch[tid]) {
-						// making it read valid with auto invalidation
+						// this case is a data race. 
+						// this may be caused by potential miss of writeback from other cores.
 						GetLock(&Lock, tid+1);
-						(* (bitVectorForGlobalVariable(a)) )[tid*2  ] = 0;
-						(* (bitVectorForGlobalVariable(a)) )[tid*2+1] = 1;
-						Logger.log("[tid: %d] auto invalidated for address 0x%lx, allocated to name:%s, base=0x%lx offset=0x%x", 
-							tid, a, getGlobalVariableName(a), baseInGlobalVariable(a), offsetInGlobalVariable(a));
+						Logger.error("[tid: %d] thread %d has dirty copy, but current thread tries to read with auto invalidation for address 0x%lx, name %s, base=0x%lx, offset=0x%x at line %d file %s",
+						tid, j, a, getGlobalVariableName(a), baseInGlobalVariable(a), offsetInGlobalVariable(a), line, filename.c_str());
 						ReleaseLock(&Lock);
-						continue;
-					}
-
-					int col, line;
-					string filename;
-
-					if (SrcReadTracking) {
-						PIN_LockClient();
-						PIN_GetSourceLocation(applicationIp, &col, &line, &filename);
-						PIN_UnlockClient();
-					}
-
-					// means 'need invalidation'
-					GetLock(&Lock, tid+1);
-					Logger.error("[tid: %d] read without invalidation: addr=0x%lx, %s (offset %ld 0x%lx), read at line %d file %s", tid, a, getGlobalVariableName(a), offsetInGlobalVariable(a), offsetInGlobalVariable(a), line, filename.c_str());
-					ReleaseLock(&Lock);
+					}						
 				}
-			}
-			else if ( (* (bitVectorForGlobalVariable(a)) )[tid*2+1] == 0) {
-				// means currently invalid state
-				Logger.ext_debug("read at unloaded state");
-				(* (bitVectorForGlobalVariable(a)) )[tid*2+1] = 1;	// change to read valid state
-			}
+
+				// invalidation test
+				if ( (* (bitVectorForGlobalVariable(a)) )[tid*2] == 1) {
+					if ( (* (bitVectorForGlobalVariable(a)) )[tid*2+1] == 1) {
+
+						if ( ((MutexLocked[tid] == Locked) && AutoInvForLock[tid]) ||
+							 ((MutexLocked[tid] == Unlocked) && AutoInvForEpoch[tid]) ) {
+							// making it read valid with auto invalidation
+							(* (bitVectorForGlobalVariable(a)) )[tid*2  ] = 0;
+							(* (bitVectorForGlobalVariable(a)) )[tid*2+1] = 1;
+							GetLock(&Lock, tid+1);
+							Logger.log("[tid: %d] auto invalidated for address 0x%lx, allocated to name:%s, base=0x%lx offset=0x%x", 
+								tid, a, getGlobalVariableName(a), baseInGlobalVariable(a), offsetInGlobalVariable(a));
+							ReleaseLock(&Lock);
+							continue;
+						}
+
+						// means 'need invalidation'
+						GetLock(&Lock, tid+1);
+						Logger.error("[tid: %d] read without invalidation: addr=0x%lx, %s (offset %ld 0x%lx), read at line %d file %s", tid, a, getGlobalVariableName(a), offsetInGlobalVariable(a), offsetInGlobalVariable(a), line, filename.c_str());
+						ReleaseLock(&Lock);
+					}
+				}
+				else if ( (* (bitVectorForGlobalVariable(a)) )[tid*2+1] == 0) {
+					// means currently invalid state
+					Logger.ext_debug("read at unloaded state");
+					(* (bitVectorForGlobalVariable(a)) )[tid*2+1] = 1;	// change to read valid state
+				}
+			}	// end of for loop
+		}	// if global variable
+		else {
+			// if the memory location is not within allocated area and global area,
+			// we need to release the lock anyway.
+			ReleaseLock(&Lock);
 		}
-	}
-	
+	}	// if (checkEnabled)	
 }
 
 
@@ -4899,7 +4953,8 @@ VOID WritesMemBefore(ADDRINT applicationIp, THREADID tid, ADDRINT memoryAddressW
 	if (!MainRunning)
 		return;
 
-	// During pthread synchronization functions, we disable read/write tracking.
+	// During pthread synchronization functions, we disable read/write tracking
+	// because it will access pthread-internal data structures.
 	if (DuringBarrierFunc[tid] == true)
 		return;
 	if (DuringCondFunc[tid] == true)
@@ -4908,6 +4963,7 @@ VOID WritesMemBefore(ADDRINT applicationIp, THREADID tid, ADDRINT memoryAddressW
 		return;
 
 	if (CheckEnabled == false) {
+		// even if check is not enabled, we need to track memory allocation.
 		if (AfterAlloc[tid] == false)
 			return;
 	}
@@ -4915,10 +4971,13 @@ VOID WritesMemBefore(ADDRINT applicationIp, THREADID tid, ADDRINT memoryAddressW
 	if (sp != 0)
 		StackPointer[tid] = sp;
 
-	if (memoryAddressWrite <= StackBase[tid] && memoryAddressWrite >= StackPointer[tid])
-		// read access for local stack address
-		return;
+	if ((memoryAddressWrite <= StackBase[tid]) && (memoryAddressWrite >= StackPointer[tid]))
+		// if write access for local stack address
+		if (AfterAlloc[tid] == false)
+			// and if not related to allocation, we are not interested in stack accesses.
+			return;
 
+	// return ;
 
 	INT32	col, line;
 	string	filename;
@@ -4926,248 +4985,246 @@ VOID WritesMemBefore(ADDRINT applicationIp, THREADID tid, ADDRINT memoryAddressW
 	filename = "";
 
 	if (SrcWriteTracking) {
-		if (CheckEnabled) {
-			PIN_LockClient();
-			PIN_GetSourceLocation(applicationIp, &col, &line, &filename);
-			PIN_UnlockClient();
-		}
+		PIN_LockClient();
+		PIN_GetSourceLocation(applicationIp, &col, &line, &filename);
+		PIN_UnlockClient();
 	}
 
 
 	if (CheckEnabled) {
+		// Now only for global/heap addresses
 
-	// For memory-allocated address, written words should be recorded.
-	//if (MATracker.contain(memoryAddressWrite)) {
-	//if (MATracker.contain2(memoryAddressWrite)) {
-	INT32	index;
-	index = MATracker.containIndex(memoryAddressWrite);
-	if (index >= 0) {
-		// File trace is disabled for now.
-		//GetLock(&Lock, tid+1);
-		//fprintf(Trace, "[tid: %d] %d Write address = 0x%lx\n", tid, BarrierCount, memoryAddressWrite);
-		//fflush(Trace);
-		NumWrites[tid].count++;
-		//ReleaseLock(&Lock);
-//		goto HERE;
+		// first version
+		//if (MATracker.contain(memoryAddressWrite)) {
+		// second version
+		//if (MATracker.contain2(memoryAddressWrite)) {
+		// third version
+		//INT32	index;
+		//index = MATracker.containIndex(memoryAddressWrite);
+		//if (index >= 0) {
+		// fourth version
+		addrMapIterator myIt;
+		GetLock(&Lock, tid+1);
+		//myIt = MATracker.containIterator(memoryAddressWrite, memoryWriteSize);
+		// and fifth version (current)
+		// all previous versions have performance issues of O(nlogn) complexity
+		// or atomicity violation.
+		myIt = MATracker.containIterator2(memoryAddressWrite);
+		// we need to use lock all around MATracker accesses.
 
-		//Logger.log("[tid: %d] epoch: %d Write address = 0x%lx for alloc",
-		//	tid, BarrierCount, memoryAddressWrite);
+		if (MATracker.isAddrMapEnd(myIt) == false) {
+			// when we skip allocated area handling routine 
+			//goto HERE;
+			NumWrites[tid].count++;
 
-		if (MutexLocked[tid] == Locked)
-			Logger.ext_debug("[tid: %d] epoch: %d Locked / Write address = 0x%lx to %s for %d",
-				tid, BarrierCount, memoryAddressWrite, MATracker.getVariableName(memoryAddressWrite).c_str(), memoryWriteSize);
-		else
-			Logger.ext_debug("[tid: %d] epoch: %d Write address = 0x%lx to %s for %d",
-				tid, BarrierCount, memoryAddressWrite, MATracker.getVariableName(memoryAddressWrite).c_str(), memoryWriteSize);
+			// the following code is just commented out to avoid any overhead.
+			//if (MutexLocked[tid] == Locked)
+			//	Logger.ext_debug("[tid: %d] epoch: %d Locked / Write address = 0x%lx to %s for %d",
+			//		tid, BarrierCount, memoryAddressWrite, MATracker.getVariableName(memoryAddressWrite).c_str(), memoryWriteSize);
+			//else
+			//	Logger.ext_debug("[tid: %d] epoch: %d Write address = 0x%lx to %s for %d",
+			//		tid, BarrierCount, memoryAddressWrite, MATracker.getVariableName(memoryAddressWrite).c_str(), memoryWriteSize);
 
-		startWordAddress = memoryAddressWrite & ADDR_MASK;
-		//endWordAddress = (memoryAddressWrite + memoryWriteSize) & ADDR_MASK;
-		//startOffset = memoryAddressWrite & offsetMask;
+			startWordAddress = memoryAddressWrite & ADDR_MASK;
+			//endWordAddress = (memoryAddressWrite + memoryWriteSize) & ADDR_MASK;
+			//startOffset = memoryAddressWrite & offsetMask;
 
-		for (ADDRINT a = startWordAddress; a < memoryAddressWrite + memoryWriteSize; a += WORD_BYTES)
-		{
-			if (MutexLocked[tid] == Locked) {
-				// add this word to written words group
-				/*
-				for (WrittenWordsIterator[tid] = WrittenWordsInThisLock[tid].begin(); WrittenWordsIterator[tid] != WrittenWordsInThisLock[tid].end(); WrittenWordsIterator[tid]++)
-				{
-					if (*WrittenWordsIterator[tid] == a)
-						break;
+			for (ADDRINT a = startWordAddress; a < memoryAddressWrite + memoryWriteSize; a += WORD_BYTES)
+			{
+				if (MutexLocked[tid] == Locked) {
+					// add this word to written words group
+					// the following code is for vector or list.
+					// since this requires additional care for duplicated copy, we use set instead.
+					//for (WrittenWordsIterator[tid] = WrittenWordsInThisLock[tid].begin(); WrittenWordsIterator[tid] != WrittenWordsInThisLock[tid].end(); WrittenWordsIterator[tid]++)
+					//{
+					//	if (*WrittenWordsIterator[tid] == a)
+					//		break;
+					//}
+					//
+					//if (WrittenWordsIterator[tid] == WrittenWordsInThisLock[tid].end())
+					//	WrittenWordsInThisLock[tid].push_back(a);
+					
+					// stl set implementation, to avoid duplicated entry
+					WrittenWordsInThisLock[tid].insert(a);
+				}
+				else {
+					// set implementation
+					WrittenWordsInThisEpoch[tid].insert(a);
 				}
 
-				if (WrittenWordsIterator[tid] == WrittenWordsInThisLock[tid].end())
-					WrittenWordsInThisLock[tid].push_back(a);
+				// Checking if this is the latest word
+				// However, for writes, this may not be required.
+
+				/*
+				if ( (* (MATracker.bitVector(a)) )[tid*2] == 1) {
+					if ( (* (MATracker.bitVector(a)) )[tid*2+1] == 1) {
+						// means 'need invalidation'
+						//Logger.warn("[tid: %d] write without invalidation: %s (addr: 0x%lx, base 0x%lx offset %ld 0x%lx)", tid, MATracker.getVariableName(a).c_str(), a, MATracker.getBase(a), MATracker.getOffset(a), MATracker.getOffset(a));
+						Logger.warn("[tid: %d] write without invalidation: addr=0x%lx, %s (offset %ld 0x%lx), read at line %d file %s", tid, a, MATracker.getVariableName(a).c_str(), MATracker.getOffset(a), MATracker.getOffset(a), line, filename.c_str());
+
+					}
+				}
+				else if ( (* (MATracker.bitVector(a)) )[tid*2+1] == 0) {
+					// means currently invalid state
+					Logger.ext_debug("write at unloaded state");
+					(* (MATracker.bitVector(a)) )[tid*2] = 1;
+					(* (MATracker.bitVector(a)) )[tid*2+1] = 0;
+				}
+				else if ( (* (MATracker.bitVector(a)) )[tid*2+1] == 1) {
+					// means currently read valid state
+					Logger.ext_debug("write at read valid state");
+					(* (MATracker.bitVector(a)) )[tid*2] = 1;
+					(* (MATracker.bitVector(a)) )[tid*2+1] = 0;
+				}
 				*/
 
-				// set implementation
-				WrittenWordsInThisLock[tid].insert(a);
-			}
-			else {
-				// add this word to written words group
-				/*
-				for (WrittenWordsIterator[tid] = WrittenWordsInThisEpoch[tid].begin(); WrittenWordsIterator[tid] != WrittenWordsInThisEpoch[tid].end(); WrittenWordsIterator[tid]++)
-				{
-					if (*WrittenWordsIterator[tid] == a)
-						break;
+				//goto HERE;
+
+			
+				bitset<MAX_STATES>* bv;
+				//bv = MATracker.bitVectorIndex(a, index);
+				//myIt = MATracker.containIterator2(memoryAddressWrite, memoryWriteSize);
+				bv = MATracker.bitVectorIterator(a, myIt);
+			
+				if ( (*bv)[tid*2] == 1) {
+					if ((*bv)[tid*2+1] == 1) {
+						// means 'need invalidation'
+						//Logger.warn("[tid: %d] write without invalidation: %s (addr: 0x%lx, base 0x%lx offset %ld 0x%lx)", tid, MATracker.getVariableName(a).c_str(), a, MATracker.getBase(a), MATracker.getOffset(a), MATracker.getOffset(a));
+						//Logger.warn("[tid: %d] write without invalidation: addr=0x%lx, %s (offset %ld 0x%lx), read at line %d file %s", tid, a, MATracker.getVariableName(a).c_str(), MATracker.getOffsetIndex(a, index), MATracker.getOffsetIndex(a, index), line, filename.c_str());
+
+						//Logger.warn("[tid: %d] write without invalidation: addr=0x%lx, %s (offset %ld 0x%lx), write at line %d file %s", tid, a, MATracker.getVariableNameIterator(myIt).c_str(), MATracker.getOffsetIterator(a, myIt), MATracker.getOffsetIterator(a, myIt), line, filename.c_str());
+						Logger.warn("[tid: %d] write without invalidation: addr=0x%lx, write at line %d file %s", tid, a, line, filename.c_str());
+
+						//Logger.warn("[tid: %d] write without invalidation: addr=0x%lx, (offset %ld 0x%lx), write at line %d file %s", tid, a, MATracker.getOffsetIterator(a, myIt), MATracker.getOffsetIterator(a, myIt), line, filename.c_str());
+					}
 				}
-
-				if (WrittenWordsIterator[tid] == WrittenWordsInThisEpoch[tid].end())
-					// For list,
-					//WrittenWordsInThisEpoch[tid].push_back(a);
-					// For set,
-					WrittenWordsInThisEpoch[tid].insert(WrittenWordsIterator[tid], a);
-				*/
-
-				// set implementation
-				WrittenWordsInThisEpoch[tid].insert(a);
-		//Logger.log("[tid: %d] epoch: %d Write address = 0x%lx for alloc is added",
-		//	tid, BarrierCount, a);
+				else if ( (*bv)[tid*2+1] == 0) {
+					// means currently invalid state
+					Logger.ext_debug("write at unloaded state");
+					(* bv )[tid*2] = 1;
+					(* bv )[tid*2+1] = 0;
+				}
+				else if ( (* bv )[tid*2+1] == 1) {
+					// means currently read valid state
+					Logger.ext_debug("write at read valid state");
+					(* bv )[tid*2] = 1;
+					(* bv )[tid*2+1] = 0;
+				}			
 			}
 
-			// Checking if this is the latest word
-			// However, for writes, this may not be required.
+			ReleaseLock(&Lock);
+		}	// end of heap-allocated memory processing
+		else if (isGlobalVariable(memoryAddressWrite)) {
+			// This is not dynamically changing data structure, so that we can assume no problems of thread-safety.
+			// For general global memory variables, written words should be recorded.
+			ReleaseLock(&Lock);
+			NumWrites[tid].count++;
 
-			/*
-			if ( (* (MATracker.bitVector(a)) )[tid*2] == 1) {
-				if ( (* (MATracker.bitVector(a)) )[tid*2+1] == 1) {
-					// means 'need invalidation'
-					//Logger.warn("[tid: %d] write without invalidation: %s (addr: 0x%lx, base 0x%lx offset %ld 0x%lx)", tid, MATracker.getVariableName(a).c_str(), a, MATracker.getBase(a), MATracker.getOffset(a), MATracker.getOffset(a));
-					Logger.warn("[tid: %d] write without invalidation: addr=0x%lx, %s (offset %ld 0x%lx), read at line %d file %s", tid, a, MATracker.getVariableName(a).c_str(), MATracker.getOffset(a), MATracker.getOffset(a), line, filename.c_str());
+			// commented out for performance
+			//if (MutexLocked[tid] == Locked)
+			//	Logger.ext_debug("[tid: %d] epoch: %d Locked / Write address = 0x%lx to %s",
+			//		tid, BarrierCount, memoryAddressWrite, getGlobalVariableName(memoryAddressWrite));
+			//else
+			//	Logger.ext_debug("[tid: %d] epoch:%d Write address = 0x%lx to %s",
+			//		tid, BarrierCount, memoryAddressWrite, getGlobalVariableName(memoryAddressWrite));
+
+			startWordAddress = memoryAddressWrite & ADDR_MASK;
+			//endWordAddress = (memoryAddressWrite + memoryWriteSize) & ADDR_MASK;
+			//startOffset = memoryAddressWrite & offsetMask;
+
+			for (ADDRINT a = startWordAddress; a < memoryAddressWrite + memoryWriteSize; a += WORD_BYTES)
+			{
+				if (MutexLocked[tid] == Locked) {
+				
+					//for (WrittenWordsIterator[tid] = WrittenWordsInThisLock[tid].begin(); WrittenWordsIterator[tid] != WrittenWordsInThisEpoch[tid].end(); WrittenWordsIterator[tid]++)
+					//{
+					//	if (*WrittenWordsIterator[tid] == a)
+					//		break;
+					//}
+					//
+					//if (WrittenWordsIterator[tid] == WrittenWordsInThisLock[tid].end())
+					//	// if not added yet, add it
+					//	WrittenWordsInThisLock[tid].push_back(a);
+				
+
+					// set implementation
+					WrittenWordsInThisLock[tid].insert(a);
+				}
+				else {
+		
+					//for (WrittenWordsIterator[tid] = WrittenWordsInThisEpoch[tid].begin(); WrittenWordsIterator[tid] != WrittenWordsInThisEpoch[tid].end(); WrittenWordsIterator[tid]++)
+					//{
+					//	if (*WrittenWordsIterator[tid] == a)
+					//		break;
+					//}
+					//
+					//if (WrittenWordsIterator[tid] == WrittenWordsInThisEpoch[tid].end())
+					//	// if not added yet, add it
+					//	WrittenWordsInThisEpoch[tid].push_back(a);
+				
+
+					// set implementation
+					WrittenWordsInThisEpoch[tid].insert(a);
 
 				}
-			}
-			else if ( (* (MATracker.bitVector(a)) )[tid*2+1] == 0) {
-				// means currently invalid state
-				Logger.ext_debug("write at unloaded state");
-				(* (MATracker.bitVector(a)) )[tid*2] = 1;
-				(* (MATracker.bitVector(a)) )[tid*2+1] = 0;
-			}
-			else if ( (* (MATracker.bitVector(a)) )[tid*2+1] == 1) {
-				// means currently read valid state
-				Logger.ext_debug("write at read valid state");
-				(* (MATracker.bitVector(a)) )[tid*2] = 1;
-				(* (MATracker.bitVector(a)) )[tid*2+1] = 0;
-			}
-			*/
-
-
-			bitset<MAX_STATES>* bv;
-			bv = MATracker.bitVectorIndex(a, index);
-			if ( (*bv)[tid*2] == 1) {
-				if ((*bv)[tid*2+1] == 1) {
-					// means 'need invalidation'
-					//Logger.warn("[tid: %d] write without invalidation: %s (addr: 0x%lx, base 0x%lx offset %ld 0x%lx)", tid, MATracker.getVariableName(a).c_str(), a, MATracker.getBase(a), MATracker.getOffset(a), MATracker.getOffset(a));
-					GetLock(&Lock, tid+1);
-					Logger.warn("[tid: %d] write without invalidation: addr=0x%lx, %s (offset %ld 0x%lx), read at line %d file %s", tid, a, MATracker.getVariableName(a).c_str(), MATracker.getOffsetIndex(a, index), MATracker.getOffsetIndex(a, index), line, filename.c_str());
-					ReleaseLock(&Lock);
+	
+				if ( (* (bitVectorForGlobalVariable(a)) )[tid*2] == 1) {
+					if ( (* (bitVectorForGlobalVariable(a)) )[tid*2+1] == 1) {
+						// means 'need invalidation'
+						GetLock(&Lock, tid+1);
+						Logger.warn("[tid: %d] write without invalidation: %s (offset: %ld 0x%lx)", tid, getGlobalVariableName(a), offsetInGlobalVariable(a), offsetInGlobalVariable(a));
+						ReleaseLock(&Lock);
+					}
 				}
-			}
-			else if ( (*bv)[tid*2+1] == 0) {
-				// means currently invalid state
-				Logger.ext_debug("write at unloaded state");
-				(* bv )[tid*2] = 1;
-				(* bv )[tid*2+1] = 0;
-			}
-			else if ( (* bv )[tid*2+1] == 1) {
-				// means currently read valid state
-				Logger.ext_debug("write at read valid state");
-				(* bv )[tid*2] = 1;
-				(* bv )[tid*2+1] = 0;
-			}
+				else if ( (* (bitVectorForGlobalVariable(a)) )[tid*2+1] == 0) {
+					// means currently invalid state
+					Logger.ext_debug("write at unloaded state");
+					(* (bitVectorForGlobalVariable(a)) )[tid*2] = 1;
+					(* (bitVectorForGlobalVariable(a)) )[tid*2+1] = 0;
+					//Logger.ext_debug("check2 %s", (bitVectorForGlobalVariable(0x6064a0))->to_string().c_str());
+				}
+				else if ( (* (bitVectorForGlobalVariable(a)) )[tid*2+1] == 1) {
+					// means currently read valid state
+					Logger.ext_debug("write at read valid state");
+					(* (bitVectorForGlobalVariable(a)) )[tid*2] = 1;
+					(* (bitVectorForGlobalVariable(a)) )[tid*2+1] = 0;
+				}
+			}	// end of for loop
+		}	// if global variable
+		else {
+			// if the memory location is not within allocated area and global area,
+			// we need to release the lock anyway.
+			ReleaseLock(&Lock);
 		}
-
-	}
-	// For general global memory variables, written words should be recorded.
-	else if (isGlobalVariable(memoryAddressWrite)) {
-		// File trace is disabled for now.
-		//GetLock(&Lock, tid+1);
-		//fprintf(Trace, "[tid: %d] %d Write address = 0x%lx\n", tid, BarrierCount, memoryAddressWrite);
-		//fflush(Trace);
-		NumWrites[tid].count++;
-		//ReleaseLock(&Lock);
-
-		//Logger.log("[tid: %d] epoch: %d Write address = 0x%lx for global",
-		//	tid, BarrierCount, memoryAddressWrite);
-
-		if (MutexLocked[tid] == Locked)
-			Logger.ext_debug("[tid: %d] epoch: %d Locked / Write address = 0x%lx to %s",
-				tid, BarrierCount, memoryAddressWrite, getGlobalVariableName(memoryAddressWrite));
-		else
-			Logger.ext_debug("[tid: %d] epoch:%d Write address = 0x%lx to %s",
-				tid, BarrierCount, memoryAddressWrite, getGlobalVariableName(memoryAddressWrite));
-
-		startWordAddress = memoryAddressWrite & ADDR_MASK;
-		//endWordAddress = (memoryAddressWrite + memoryWriteSize) & ADDR_MASK;
-		//startOffset = memoryAddressWrite & offsetMask;
-
-		for (ADDRINT a = startWordAddress; a < memoryAddressWrite + memoryWriteSize; a += WORD_BYTES)
-		{
-			if (MutexLocked[tid] == Locked) {
-				/*
-				for (WrittenWordsIterator[tid] = WrittenWordsInThisLock[tid].begin(); WrittenWordsIterator[tid] != WrittenWordsInThisEpoch[tid].end(); WrittenWordsIterator[tid]++)
-				{
-					if (*WrittenWordsIterator[tid] == a)
-						break;
-				}
-
-				if (WrittenWordsIterator[tid] == WrittenWordsInThisLock[tid].end())
-					// if not added yet, add it
-					WrittenWordsInThisLock[tid].push_back(a);
-				*/
-
-				// set implementation
-				WrittenWordsInThisLock[tid].insert(a);
-			}
-			else {
-				/*
-				for (WrittenWordsIterator[tid] = WrittenWordsInThisEpoch[tid].begin(); WrittenWordsIterator[tid] != WrittenWordsInThisEpoch[tid].end(); WrittenWordsIterator[tid]++)
-				{
-					if (*WrittenWordsIterator[tid] == a)
-						break;
-				}
-
-				if (WrittenWordsIterator[tid] == WrittenWordsInThisEpoch[tid].end())
-					// if not added yet, add it
-					WrittenWordsInThisEpoch[tid].push_back(a);
-				*/
-
-				// set implementation
-				WrittenWordsInThisEpoch[tid].insert(a);
-
-			}
-
-			if ( (* (bitVectorForGlobalVariable(a)) )[tid*2] == 1) {
-				if ( (* (bitVectorForGlobalVariable(a)) )[tid*2+1] == 1) {
-					// means 'need invalidation'
-					GetLock(&Lock, tid+1);
-					Logger.warn("[tid: %d] write without invalidation: %s (offset: %ld 0x%lx)", tid, getGlobalVariableName(a), offsetInGlobalVariable(a), offsetInGlobalVariable(a));
-					ReleaseLock(&Lock);
-				}
-			}
-			else if ( (* (bitVectorForGlobalVariable(a)) )[tid*2+1] == 0) {
-				// means currently invalid state
-				Logger.ext_debug("write at unloaded state");
-				(* (bitVectorForGlobalVariable(a)) )[tid*2] = 1;
-				(* (bitVectorForGlobalVariable(a)) )[tid*2+1] = 0;
-				//Logger.ext_debug("check2 %s", (bitVectorForGlobalVariable(0x6064a0))->to_string().c_str());
-			}
-			else if ( (* (bitVectorForGlobalVariable(a)) )[tid*2+1] == 1) {
-				// means currently read valid state
-				Logger.ext_debug("write at read valid state");
-				(* (bitVectorForGlobalVariable(a)) )[tid*2] = 1;
-				(* (bitVectorForGlobalVariable(a)) )[tid*2+1] = 0;
-			}
-		}
-
-	}
-	//Logger.ext_debug("check3 %s", (bitVectorForGlobalVariable(0x6064a0))->to_string().c_str());
-
 	}	// if (CheckEnabled)
 
 //HERE:
 	if (AfterAlloc[tid]) {
 		// Standard library malloc returns pointer to the variable in rax.
 		// So, I guess the first write instruction with rax after malloc call has the pointer assignment.
-		//
+		// This assumption is valid only when rax is used for writing to the original variable.
+		// Optimization of the program might copy rax to other register, and use this new register to write to the variable.
+		// Thus, we need to have unoptimized program to track allocated memory.
+		// I recommend to use no optimization for the program (-O0).
+
 		// Currently checking if this instruction is for malloc statement is ugly.
 		// [TODO] Find the better way without string comparison
-		// printf("%s\n", DisAssemblyMap[applicationIp].c_str());
-			#ifdef __64BIT__
-			if (strstr(DisAssemblyMap[applicationIp].c_str(), "rax")) {
-			#else
-			// 32-bit version should be revised according to drd version
-			if (strstr(DisAssemblyMap[applicationIp].c_str(), "eax")) {
-			#endif
+		GetLock(&Lock, tid+1);
+
+		#ifdef __64BIT__
+		if (strstr(DisAssemblyMap[applicationIp].c_str(), "rax")) {
+		#else
+		// 32-bit version should be revised according to drd version
+		if (strstr(DisAssemblyMap[applicationIp].c_str(), "eax")) {
+		#endif
 			// Source code tracing
 			INT32	col, line;
 			string	filename;
 
-			// temp, windy
 			PIN_LockClient();
 			PIN_GetSourceLocation(applicationIp, &col, &line, &filename);
 			PIN_UnlockClient();
 
-			GetLock(&Lock, tid+1);
 			Logger.log("[tid: %d] Memory allocation was done in location: col %d line %d file %s\n", tid, col, line, filename.c_str());
 
 			MATracker.addSource(col, line, filename);
@@ -5175,31 +5232,36 @@ VOID WritesMemBefore(ADDRINT applicationIp, THREADID tid, ADDRINT memoryAddressW
 			// Global variable tracing
 			//printf("[DEBUG] allocation 0x%lx\n", memoryAddressWrite);
 			Logger.log("[tid: %d] memory allocation to addr 0x%lx", tid, memoryAddressWrite);
+			bool done = false;
 			for (GlobalVariableVecIterator = GlobalVariableVec.begin(); GlobalVariableVecIterator != GlobalVariableVec.end(); GlobalVariableVecIterator++)
 			{
 				if ((*GlobalVariableVecIterator).addr == memoryAddressWrite) {
-	//Logger.ext_debug("check5 %s", (bitVectorForGlobalVariable(0x6064a0))->to_string().c_str());
 					MATracker.addVariableName((*GlobalVariableVecIterator).name, 0);
-	//Logger.ext_debug("check6 %s", (bitVectorForGlobalVariable(0x6064a0))->to_string().c_str());
 					(*GlobalVariableVecIterator).allocAddr = MATracker.prevAddr;
 					(*GlobalVariableVecIterator).allocSize = MATracker.prevSize;
 					//(*GlobalVariableVecIterator).attachState();
-	//Logger.ext_debug("check7 %s", (bitVectorForGlobalVariable(0x6064a0))->to_string().c_str());
+					done = true;
+					break;
 				}
 				else if ( ((*GlobalVariableVecIterator).addr < memoryAddressWrite) &&
 					(memoryAddressWrite < (*GlobalVariableVecIterator).addr + (*GlobalVariableVecIterator).size) ) {
 					int offset = ((*GlobalVariableVecIterator).addr + (*GlobalVariableVecIterator).size - memoryAddressWrite) / 8;
 					MATracker.addVariableName((*GlobalVariableVecIterator).name, offset);
+					done = true;
+					break;
 				}
 			}
-			ReleaseLock(&Lock);
 
+			// if not matched to any previous global variable, this should be named as 'noname'
+			if (done == false)
+				MATracker.addVariableName("Noname", 0);
 
 			AfterAlloc[tid] = false;
 		}
-	}
-	//Logger.ext_debug("check4 %s", (bitVectorForGlobalVariable(0x6064a0))->to_string().c_str());
+		ReleaseLock(&Lock);
+	}	// if memory allocation
 }	// void WritesMemBefore
+
 
 
 
@@ -5231,7 +5293,7 @@ VOID Instruction(INS ins, void * v)
 		//printf("INS_Address(ins) = 0x%lx\n", INS_Address(ins));
 
 		// INS_InsertPredicatedCall is identical to INS_InsertCall except predicated instructions.
-		// Predicated instructions are CMOVcc, FCMOVcc and REPped string ops.
+			// Predicated instructions are CMOVcc, FCMOVcc and REPped string ops.
 
 		if (INS_MemoryOperandIsRead(ins, memOp)) {
 			// read operation
@@ -5288,10 +5350,9 @@ VOID ThreadStart(THREADID tid, CONTEXT *ctxt, INT32 flags, VOID *V)
 	if (NumThreads == 2) {
 		// if first thread spawning, we need to check current writeback status.
 
-		AnalyzeBarrierRegion(0);
+		AnalyzeBarrierRegion(0);	// only analyze for master thread 0.
 		WrittenWordsInThisEpoch[0].clear();
 
-		// temp, windy
 		Logger.warn("*** Epoch %d ended ***\n\n", BarrierCount);
 
 		BarrierCount++;
@@ -5313,7 +5374,6 @@ VOID ThreadFini(THREADID tid, const CONTEXT *ctxt, INT32 flags, VOID *V)
 	WrittenWordsInThisEpoch[tid].clear();
 
 	if (NumThreads == 1) {
-		// temp, windy
 		Logger.warn("*** Epoch %d ended ***", BarrierCount);
 		
 		BarrierCount++;
@@ -5321,6 +5381,7 @@ VOID ThreadFini(THREADID tid, const CONTEXT *ctxt, INT32 flags, VOID *V)
 	
 	ReleaseLock(&Lock);
 }
+
 
 
 
@@ -5339,24 +5400,22 @@ VOID FinalAnalysis()
 
 	// Report if allocated memory is written but not written back.
 
-	// source code reference for memory allocation is removed.
-	//struct sourceLocation* sl;
 	string s2;
 	vector<struct GlobalVariableStruct>::iterator	it;
-	//list<ADDRINT>::iterator	wit;
 	set<ADDRINT>::iterator		wit;
+	BOOL	done;
 
 	for (int i = 0; i < MaxThreads; i++) {
 		Logger.log("In thread %d,\n", i);
 		for (wit = WrittenWordsInThisEpoch[i].begin(); wit != WrittenWordsInThisEpoch[i].end(); wit++)
 		{
 			// check global variable
-			BOOL done = false;
+			done = false;
 			for (it = GlobalVariableVec.begin(); it != GlobalVariableVec.end(); it++)
 			{
 				if ( (*wit >= (*it).addr) &&
 					 (*wit < (*it).addr + (*it).size) ) {
-					Logger.log("0x%lx for %s (offset 0x%x %d) is not written back.\n", *wit, (*it).name.c_str(), (int) (*wit - (*it).addr), (int) (*wit - (*it).addr));
+					Logger.log("0x%lx for %s (offset 0x%x %d) is not written back.", *wit, (*it).name.c_str(), (int) (*wit - (*it).addr), (int) (*wit - (*it).addr));
 					done = true;
 					break;
 				}
@@ -5366,17 +5425,26 @@ VOID FinalAnalysis()
 
 			// check allocated memory
 			s2 = MATracker.getVariableName(*wit);
+
 			ADDRINT	allocAddr;
 			//int		allocSize;
 
+			done = false;
 			for (it = GlobalVariableVec.begin(); it != GlobalVariableVec.end(); it++) 
 			{
 				if (s2 == (*it).name) {
 					allocAddr = (*it).allocAddr;
 					//allocSize = (*it).allocSize;
-					Logger.log("0x%lx, allocated in %s (0x%lx, offset 0x%x %d), is not written back.\n", *wit,  s2.c_str(), allocAddr, (int) (*wit - allocAddr), (int) (*wit - allocAddr));
+					Logger.log("0x%lx, allocated in %s (0x%lx, offset 0x%x=%d), is not written back.", *wit,  s2.c_str(), allocAddr, (int) (*wit - allocAddr), (int) (*wit - allocAddr));
+					done = true;
 					break;
 				}
+			}
+			if (!done) {
+				addrMapIterator ait;
+				ait = MATracker.containIterator2(*wit);
+				allocAddr = MATracker.getBaseIterator(*wit, ait);
+				Logger.log("0x%lx, allocated in %s (0x%lx, offset 0x%x=%d), is not written back.", *wit,  s2.c_str(), allocAddr, (int) (*wit - allocAddr), (int) (*wit - allocAddr));
 			}
 
 			
@@ -5409,6 +5477,7 @@ VOID Fini(INT32 code, VOID *v)
 
 
 
+
 //-------------------------------------------------------------------
 //	Print Usage
 //-------------------------------------------------------------------
@@ -5418,6 +5487,8 @@ INT32 Usage()
 	PIN_ERROR("Checker Tool for PMC Architecture\n\n" + KNOB_BASE::StringKnobSummary() + "\n");
 	return -1;
 }
+
+
 
 
 //-------------------------------------------------------------------
@@ -5457,6 +5528,7 @@ VOID ReadVariableInfo(char *filename)
 
 	fclose(fp);
 }
+
 
 
 
@@ -5652,6 +5724,7 @@ thread_data_t* get_tls(THREADID threadid)
 		static_cast<thread_data_t*>(PIN_GetThreadData(tls_key, threadid));
 	return tdata;
 }
+
 
 
 
