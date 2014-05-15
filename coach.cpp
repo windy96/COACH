@@ -12,7 +12,7 @@
  *
  *	History
  *		started from Jun 3, 2012
- *		last updated on Mar 14, 2014
+ *		last updated on Mar 15, 2014
  *
  *	Author
  *		written by Kim, Wooil
@@ -20,6 +20,13 @@
  *
  */
 
+
+// currently, instruction instrumentation is disabled to see if how many barrier epochs are generated during execution.
+// You need to remove comment in main function to enable original COACH function.
+
+
+// Usage recommendation
+// for 
 
 #include "pin.H"
 #include <stdio.h>
@@ -50,6 +57,8 @@
 #define WORD_BITWIDTH	32
 #define WORD_BYTES		4
 //	4-byte word is assumed.
+
+#define MAX_NESTED_LOCK 5
 
 const char *configFileName = "coach.cfg";
 
@@ -731,7 +740,7 @@ public:
 			return NULL;
 		}
 
-		return &( ( (stateMap[startAddr]) )[(addr - startAddr) / 4] );
+		return &( ( (stateMap[startAddr]) )[(addr - startAddr) / WORD_BYTES] );
 	}
 
 
@@ -741,7 +750,7 @@ public:
 
 		startAddr = addrVec[index].first;
 		endAddr = startAddr + addrVec[index].second;
-		return &( ( (stateMap[startAddr]) )[(addr - startAddr) / 4] );
+		return &( ( (stateMap[startAddr]) )[(addr - startAddr) / WORD_BYTES] );
 	}
 
 	bitset<MAX_STATES>* bitVectorIterator(ADDRINT addr, map<ADDRINT, int>::iterator myIt)
@@ -750,7 +759,8 @@ public:
 
 		startAddr = myIt->first;
 		endAddr = startAddr + myIt->second;
-		return &( ( (stateMap[startAddr]) )[(addr - startAddr) / 4] );
+		return &( ( (stateMap[startAddr]) )[(addr - startAddr) / WORD_BYTES] );
+		// endAddr is not required.
 	}
 
 	void inv_all_for_thread(int tid)
@@ -915,7 +925,8 @@ public:
 			Logger.error("0x%lx fails to find name", startAddr);
 		if (startAddr == 0)
 			return "noname";
-		return variableNameMap[startAddr];		
+		return variableNameMap[startAddr];
+		// [TODO] does myIt itself point to the name?
 	}
 };	// class MallocTracker
 
@@ -1059,9 +1070,13 @@ enum ProgramCategory {
 
 
 enum LockedState {
+	DuringLockFunc,
 	Unlocked,
-	Locked,
-	DuringLockFunc
+	Locked1,
+	Locked2,
+	Locked3,
+	Locked4,
+	Locked5			// we set MAX_NESTED_LOCK as 5
 };
 
 
@@ -1135,11 +1150,16 @@ map<ADDRINT, int>::iterator WrittenBackIterator[MAX_THREADS];
 //	11 means stale state
 vector<struct GlobalVariableStruct>	GlobalVariableVec;
 vector<struct GlobalVariableStruct>::iterator	GlobalVariableVecIterator;
+typedef map<ADDRINT, struct GlobalVariableStruct>	gvmap;
+gvmap												GlobalVariableMap;
+typedef gvmap::iterator								gvmapit;
+gvmapit												GlobalVariableMapIterator;
+
 
 //	This is not enough for tracking many lock variables.
 //	For only checking single lock variable, MutexLocked is used.
 int				MutexLocked[MAX_THREADS];
-void*			MutexLock[MAX_THREADS];
+void*			MutexLock[MAX_THREADS][MAX_NESTED_LOCK];
 BOOL			DuringBarrierFunc[MAX_THREADS];
 BOOL			DuringCondFunc[MAX_THREADS];
 
@@ -1152,6 +1172,8 @@ vector<ADDRINT>	LockVector;
 ADDRINT			MinLockVector;
 ADDRINT			MaxLockVector;
 
+// tracking program flow
+ADDRINT			beforeBranch[MAX_THREADS];
 
 
 //-------------------------------------------------------------------
@@ -1180,6 +1202,74 @@ BOOL isGlobalVariable(ADDRINT addr)
 	return false;
 }
 
+gvmapit isGlobalVariableIterator(ADDRINT addr)
+{
+	gvmapit		it;
+	it = GlobalVariableMap.upper_bound(addr);
+
+	if (GlobalVariableMap.size() == 0)
+		return GlobalVariableMap.end();
+
+	if (it == GlobalVariableMap.begin()) {
+		ADDRINT		startAddr, endAddr;
+		startAddr = it->first;
+		endAddr = startAddr + it->second.size;
+
+		if ((startAddr <= addr) && (endAddr > addr))
+			return it;
+		else // not within this global variable
+			return GlobalVariableMap.end();
+	}
+	else {
+		ADDRINT		startAddr, endAddr;
+		it--;
+		startAddr = it->first;
+		endAddr = startAddr + it->second.size;
+		if (endAddr > addr)
+			return it;
+		else
+			return GlobalVariableMap.end();
+	}
+}
+
+
+gvmapit isGlobalVariableIteratorDebug(ADDRINT addr)
+{
+	gvmapit		it;
+	it = GlobalVariableMap.upper_bound(addr);
+
+	if (GlobalVariableMap.size() == 0) 
+	{
+		Logger.error("0x%lx has case 1", addr);
+		return GlobalVariableMap.end();
+	}
+
+	if (it == GlobalVariableMap.begin()) {
+		ADDRINT		startAddr, endAddr;
+		startAddr = it->first;
+		endAddr = startAddr + it->second.size;
+
+		if ((startAddr <= addr) && (endAddr > addr))
+			return it;
+		else // not within this global variable
+		{
+			Logger.error("0x%lx has case 2", addr);			
+			return GlobalVariableMap.end();
+		}
+	}
+	else {
+		ADDRINT		startAddr, endAddr;
+		it--;
+		startAddr = it->first;
+		endAddr = startAddr + it->second.size;
+		if (endAddr > addr)
+			return it;
+		else {
+			Logger.error("0x%lx has case 3", addr);
+			return GlobalVariableMap.end();
+		}
+	}
+}
 
 
 //	Calculate the offset within global variable
@@ -1200,6 +1290,19 @@ ADDRINT baseInGlobalVariable(ADDRINT addr)
 }
 
 
+ADDRINT baseInGlobalVariableIterator(ADDRINT addr, gvmapit it)
+{
+	ADDRINT startAddr, endAddr;
+	startAddr = it->first;
+	endAddr = startAddr + it->second.size;
+
+	if (startAddr <= addr) {
+		if (endAddr > addr)
+			return startAddr;
+	}
+	return -1;
+}
+
 
 //	Calculate the offset within global variable
 //	The address should be for global variable. If not, -1 will be returned.
@@ -1215,6 +1318,20 @@ ADDRINT offsetInGlobalVariable(ADDRINT addr)
 			return (addr - (*it).addr);
 	}
 	// This must not happen.
+	return -1;
+}
+
+ADDRINT offsetInGlobalVariableIterator(ADDRINT addr, gvmapit it)
+{
+	ADDRINT startAddr, endAddr;
+	startAddr = it->first;
+	endAddr = startAddr + it->second.size;
+
+	if (startAddr <= addr) {
+		if (endAddr > addr)
+			return addr - startAddr;
+	}
+	Logger.error("getOffsetIterator: 0x%lx - 0x%lx", startAddr, endAddr);
 	return -1;
 }
 
@@ -1242,6 +1359,15 @@ bitset<MAX_STATES>* bitVectorForGlobalVariable(ADDRINT addr)
 }
 
 
+bitset<MAX_STATES>* bitVectorForGlobalVariableIterator(ADDRINT addr, gvmapit it)
+{
+	ADDRINT	startAddr;
+
+	startAddr = it->first;
+	return &( (it->second).pState[(addr - startAddr) / WORD_BYTES] );
+}
+
+
 const char* getGlobalVariableName(ADDRINT addr)
 {
 	vector<struct GlobalVariableStruct>::iterator	it;
@@ -1256,6 +1382,11 @@ const char* getGlobalVariableName(ADDRINT addr)
 
 	Logger.error("No match in getGlobalVariableName (end or overrun) addr = 0x%lx", addr);
 	return NULL;
+}
+
+const char* getGlobalVariableNameIterator(gvmapit it)
+{
+	return (it->second).name.c_str();
 }
 
 
@@ -1637,6 +1768,9 @@ void PMC_coherence(PMCInst function, int tid, ADDRINT addr, int size)
 	// if new writeback address overlaps previous writeback range in this epoch,
 	// this is overlap, which should be informed to the programmer.
 	// if not overlap, new address range is added to writeback map.
+
+	gvmapit myIt;
+
 	if ((function == writeback) || (function == writebackInvalidation)) {
 		map<ADDRINT, int>::iterator it;
 		bool	overlap = false;
@@ -1661,6 +1795,7 @@ void PMC_coherence(PMCInst function, int tid, ADDRINT addr, int size)
 		// [TODO] Check if this is for the latest data
 		// [TODO] consider size. may need to be included in for loop.
 		// word alignment should be considered.
+		/*
 		if (isGlobalVariable(addr)) {
 			ADDRINT	addr2;
 			for (addr2 = addr; addr2 < addr + size; addr2 += WORD_BYTES)
@@ -1736,6 +1871,83 @@ void PMC_coherence(PMCInst function, int tid, ADDRINT addr, int size)
 				Logger.ext_debug("[tid: %d] writeback to 0x%lx makes all other threads' state as stale.", tid, addr2);
 			}
 		}
+		*/
+		myIt = isGlobalVariableIterator(addr);
+		if (myIt != GlobalVariableMap.end()) {
+			ADDRINT	addr2;
+			for (addr2 = addr; addr2 < addr + size; addr2 += WORD_BYTES)
+			{
+				Logger.ext_debug("[tid: %d] addr2 = %lx", tid, addr2);
+				if (bitVectorForGlobalVariableIterator(addr2, myIt) == 0)
+					//break;
+					continue;
+				if ( (* (bitVectorForGlobalVariableIterator(addr2, myIt)) )[tid*2] == 0 &&
+					 (* (bitVectorForGlobalVariableIterator(addr2, myIt)) )[tid*2+1] == 0 ) {
+					Logger.ext_debug("no wb from virgin");
+					continue;
+				}
+				if ( (* (bitVectorForGlobalVariableIterator(addr2, myIt)) )[tid*2] == 0 &&
+					 (* (bitVectorForGlobalVariableIterator(addr2, myIt)) )[tid*2+1] == 1 ) {
+					Logger.ext_debug("no wb from read valid");
+					continue;
+				}
+				if ( (* (bitVectorForGlobalVariableIterator(addr2, myIt)) )[tid*2] == 1 &&
+					 (* (bitVectorForGlobalVariableIterator(addr2, myIt)) )[tid*2+1] == 1 ) {
+					//Logger.error("[tid: %d] stale data is written-back. addr=0x%lx", tid, addr2);
+					Logger.ext_debug("no wb because this is stale");
+					continue;
+				}
+				for (int i = 0; i < MAX_THREADS; i++)
+				{
+					Logger.ext_debug("i = %d", i);
+					Logger.ext_debug("bitvector = %lx", bitVectorForGlobalVariableIterator(addr2, myIt));
+					if (tid == i)	continue;
+
+					if ( (* (bitVectorForGlobalVariableIterator(addr2, myIt)) )[i*2] == 0 &&
+						 (* (bitVectorForGlobalVariableIterator(addr2, myIt)) )[i*2+1] == 1 ) {
+						Logger.ext_debug("case 1");
+						// 00 means unloaded state
+						// 01 means read valid state **
+						// 10 means write valid state
+						// 11 means stale state
+						(* (bitVectorForGlobalVariableIterator(addr2, myIt)) )[i*2  ] = 1;
+						(* (bitVectorForGlobalVariableIterator(addr2, myIt)) )[i*2+1] = 1;
+					}
+					else if ( (* (bitVectorForGlobalVariableIterator(addr2, myIt)) )[i*2] == 1 &&
+							  (* (bitVectorForGlobalVariableIterator(addr2, myIt)) )[i*2+1] == 0 ) {
+						Logger.ext_debug("case 2");
+						// 00 means unloaded state
+						// 01 means read valid state
+						// 10 means write valid state **
+						// 11 means stale state
+						(* (bitVectorForGlobalVariableIterator(addr2, myIt)) )[i*2  ] = 1;
+						(* (bitVectorForGlobalVariableIterator(addr2, myIt)) )[i*2+1] = 1;
+						// [TODO] check this is required, or this has potential issues.
+						// if other processor has write valid state, this may have potential violation.
+						Logger.error("[tid: %d] writeback occurs on other core(%d)'s dirty data: addr 0x%lx, name: %s, base=0x%lx, offset=0x%x", 
+							tid, i, addr2, getGlobalVariableNameIterator(myIt), baseInGlobalVariableIterator(addr2, myIt), offsetInGlobalVariableIterator(addr2, myIt));
+					}
+					// Added the case of unloaded state, assuming possible load of multi-line cache
+					else if ( (* (bitVectorForGlobalVariableIterator(addr2, myIt)) )[i*2] == 0 &&
+							 (* (bitVectorForGlobalVariableIterator(addr2, myIt)) )[i*2+1] == 0 ) {
+						Logger.ext_debug("case 2 for 0x%lx", addr2);
+						// 00 means unloaded state
+						// 01 means read valid state
+						// 10 means write valid state **
+						// 11 means stale state
+						(* (bitVectorForGlobalVariableIterator(addr2, myIt)) )[i*2  ] = 1;
+						(* (bitVectorForGlobalVariableIterator(addr2, myIt)) )[i*2+1] = 1;
+						// [TODO] check this is required, or this has potential issues.
+						// if other processor has write valid state, this may have potential violation.
+					}
+				}
+				Logger.ext_debug("case 3");
+				// Guess the following is already done in WritesMemBefore.
+				(* (bitVectorForGlobalVariableIterator(addr2, myIt)) )[tid * 2] = 0;
+				(* (bitVectorForGlobalVariableIterator(addr2, myIt)) )[tid * 2+1] = 1;
+				Logger.ext_debug("[tid: %d] writeback to 0x%lx makes all other threads' state as stale.", tid, addr2);
+			}
+		}
 		else if (MATracker.contain(addr)) {
 			// [TODO] fill this!!!
 			ADDRINT	addr2;
@@ -1783,6 +1995,7 @@ void PMC_coherence(PMCInst function, int tid, ADDRINT addr, int size)
 	if ((function == invalidation) || (function == writebackInvalidation)) {
 		// [TODO] Check if this is for the latest data
 		// [TODO] consider size. may need to be included in for loop.
+		/*
 		if (isGlobalVariable(addr)) {
 			ADDRINT	addr2;
 			for (addr2 = addr; addr2 < addr + size; addr2 += WORD_BYTES)
@@ -1791,6 +2004,20 @@ void PMC_coherence(PMCInst function, int tid, ADDRINT addr, int size)
 					 (* (bitVectorForGlobalVariable(addr2)) )[tid * 2+1] != 0 ) {
 					(* (bitVectorForGlobalVariable(addr2)) )[tid * 2] = 0;
 					(* (bitVectorForGlobalVariable(addr2)) )[tid * 2+1] = 0;
+					Logger.ext_debug("[tid: %d] invalidation to 0x%lx makes this threads' state as invalid.", tid, addr2);
+				}
+			}
+		}
+		*/
+		myIt = isGlobalVariableIterator(addr);
+		if (myIt != GlobalVariableMap.end()) {
+			ADDRINT	addr2;
+			for (addr2 = addr; addr2 < addr + size; addr2 += WORD_BYTES)
+			{
+				if ( (* (bitVectorForGlobalVariableIterator(addr2, myIt)) )[tid * 2] != 1 ||
+					 (* (bitVectorForGlobalVariableIterator(addr2, myIt)) )[tid * 2+1] != 0 ) {
+					(* (bitVectorForGlobalVariableIterator(addr2, myIt)) )[tid * 2] = 0;
+					(* (bitVectorForGlobalVariableIterator(addr2, myIt)) )[tid * 2+1] = 0;
 					Logger.ext_debug("[tid: %d] invalidation to 0x%lx makes this threads' state as invalid.", tid, addr2);
 				}
 			}
@@ -1819,12 +2046,14 @@ void PMC_process(PMCInst function, int tid, ADDRINT addr, int size)
 	endWordAddress = (addr + size) & ADDR_MASK;
 	offset = addr & offsetMask;
 
+	gvmapit	myIt;
+
 
 	// _all
 	if ((addr == 0) && (size == 1)) {
 		switch (function) {
 		case invalidation:
-			if (MutexLocked[tid] == Locked) {
+			if (MutexLocked[tid] >= Locked1) {
 				AutoInvForLock[tid] = true;
 				// will be cleared in unlockWrapper
 				Logger.log("[tid: %d] inv all for the lock", tid);
@@ -1851,7 +2080,7 @@ void PMC_process(PMCInst function, int tid, ADDRINT addr, int size)
 		case writeback:
 		case writebackInvalidation:
 			// set implementation
-			if (MutexLocked[tid] == Locked) {
+			if (MutexLocked[tid] >= Locked1) {
 				for (WrittenWordsIterator[tid] = WrittenWordsInThisLock[tid].begin();
 					WrittenWordsIterator[tid] != WrittenWordsInThisLock[tid].end();
 					WrittenWordsIterator[tid]++)
@@ -1883,7 +2112,7 @@ void PMC_process(PMCInst function, int tid, ADDRINT addr, int size)
 	if ((addr == 0) && (size == 2)) {
 		switch (function) {
 		case invalidation:
-			if (MutexLocked[tid] == Locked) {
+			if (MutexLocked[tid] >= Locked1) {
 				AutoInvForLock[tid] = true;
 				// will be cleared in unlockWrapper
 			}
@@ -1896,7 +2125,7 @@ void PMC_process(PMCInst function, int tid, ADDRINT addr, int size)
 		case writeback:
 		case writebackInvalidation:
 			// set implementation
-			if (MutexLocked[tid] == Locked) {
+			if (MutexLocked[tid] >= Locked1) {
 				for (WrittenWordsIterator[tid] = WrittenWordsInThisLock[tid].begin();
 					WrittenWordsIterator[tid] != WrittenWordsInThisLock[tid].end();
 					WrittenWordsIterator[tid]++)
@@ -1904,9 +2133,20 @@ void PMC_process(PMCInst function, int tid, ADDRINT addr, int size)
 					// for master all, written results are changed to read valid state.
 					// all other threads' states remain the same.
 					ADDRINT	a = *WrittenWordsIterator[tid];
+					/*
 					if (isGlobalVariable(a)) {
 						(* (bitVectorForGlobalVariable(a)) )[tid*2  ] = 0;
 						(* (bitVectorForGlobalVariable(a)) )[tid*2+1] = 1;
+					}
+					else if (MATracker.contain(a)) {
+						(* (MATracker.bitVector(a)) )[tid*2  ] = 0;
+						(* (MATracker.bitVector(a)) )[tid*2+1] = 1;
+					}
+					*/
+					myIt = isGlobalVariableIterator(a);
+					if (myIt != GlobalVariableMap.end()) {
+						(* (bitVectorForGlobalVariableIterator(a, myIt)) )[tid*2  ] = 0;
+						(* (bitVectorForGlobalVariableIterator(a, myIt)) )[tid*2+1] = 1;
 					}
 					else if (MATracker.contain(a)) {
 						(* (MATracker.bitVector(a)) )[tid*2  ] = 0;
@@ -1922,13 +2162,12 @@ void PMC_process(PMCInst function, int tid, ADDRINT addr, int size)
 				Logger.log("[tid: %d] wb master all for the lock", tid);
 			}
 			else {
+				// if the following is used, wb_master_all is the same as wb_all.
+				//for (WrittenWordsIterator[tid] = WrittenWordsInThisEpoch[tid].begin();
+				//	WrittenWordsIterator[tid] != WrittenWordsInThisEpoch[tid].end();
+				//	WrittenWordsIterator[tid]++)
+				//	PMC_coherence(function, tid, *WrittenWordsIterator[tid], 4);				
 
-				for (WrittenWordsIterator[tid] = WrittenWordsInThisEpoch[tid].begin();
-					WrittenWordsIterator[tid] != WrittenWordsInThisEpoch[tid].end();
-					WrittenWordsIterator[tid]++)
-					PMC_coherence(function, tid, *WrittenWordsIterator[tid], 4);				
-
-				/*
 				for (WrittenWordsIterator[tid] = WrittenWordsInThisEpoch[tid].begin();
 					WrittenWordsIterator[tid] != WrittenWordsInThisEpoch[tid].end();
 					WrittenWordsIterator[tid]++)
@@ -1936,9 +2175,20 @@ void PMC_process(PMCInst function, int tid, ADDRINT addr, int size)
 					// for master all, written results are changed to read valid state.
 					// all other threads' states remain the same.
 					ADDRINT	a = *WrittenWordsIterator[tid];
+					/*
 					if (isGlobalVariable(a)) {
 						(* (bitVectorForGlobalVariable(a)) )[tid*2  ] = 0;
 						(* (bitVectorForGlobalVariable(a)) )[tid*2+1] = 1;
+					}
+					else if (MATracker.contain(a)) {
+						(* (MATracker.bitVector(a)) )[tid*2  ] = 0;
+						(* (MATracker.bitVector(a)) )[tid*2+1] = 1;
+					}
+					*/
+					myIt = isGlobalVariableIterator(a);
+					if (myIt != GlobalVariableMap.end()) {
+						(* (bitVectorForGlobalVariableIterator(a, myIt)) )[tid*2  ] = 0;
+						(* (bitVectorForGlobalVariableIterator(a, myIt)) )[tid*2+1] = 1;
 					}
 					else if (MATracker.contain(a)) {
 						(* (MATracker.bitVector(a)) )[tid*2  ] = 0;
@@ -1951,7 +2201,6 @@ void PMC_process(PMCInst function, int tid, ADDRINT addr, int size)
 				}
 
 				WrittenWordsInThisEpoch[tid].clear();
-				*/
 				Logger.log("[tid: %d] wb master all", tid);				
 			}
 			break;
@@ -2001,7 +2250,7 @@ void PMC_process(PMCInst function, int tid, ADDRINT addr, int size)
 			}
 			*/
 			// set implementation
-			if (MutexLocked[tid] == Locked)
+			if (MutexLocked[tid] >= Locked1)
 				WrittenWordsInThisLock[tid].erase(a);
 			else
 				WrittenWordsInThisEpoch[tid].erase(a);
@@ -2014,7 +2263,7 @@ void PMC_process(PMCInst function, int tid, ADDRINT addr, int size)
 			//LC[tid].cleanEntry(a);  LC[tid].removeEntry(a);  break;
 			// like writeback
 			Logger.ext_debug("writeback and invalidation starts.");
-			if (MutexLocked[tid] == Locked)
+			if (MutexLocked[tid] >= Locked1)
 				WrittenWordsInThisLock[tid].erase(a);
 			else
 				WrittenWordsInThisEpoch[tid].erase(a);
@@ -2694,12 +2943,28 @@ VOID* lockWrapper(CONTEXT *ctxt, AFUNPTR orig_function, THREADID tid, VOID* mute
 {
 	VOID *ret;
 
+/*
+	INT32	col, line;
+	string	filename;
+	col = 0; line = 0;
+	filename = "";
+
+	PIN_LockClient();
+	PIN_GetSourceLocation(beforeBranch[tid], &col, &line, &filename);
+	PIN_UnlockClient();
+*/
+	int prevLocked;
+	prevLocked = MutexLocked[tid];
+
 	GetLock(&Lock, tid+1);
-	if (MutexLocked[tid] == Locked) {
-		Logger.error("[tid: %d] nested lock is detected", tid);
+	if (MutexLocked[tid] >= Locked1) {
+		Logger.error("[tid: %d] nested lock (already %d times) is detected", tid, prevLocked - Unlocked);
+		//Logger.error("[tid: %d] nested lock is detected at line %d, file %s", tid, line, filename.c_str());
 	}
-	Logger.log("[tid: %d] Lock 0x%x", tid, mutex);
+	//Logger.log("[tid: %d] Lock 0x%x", tid, mutex);
+	Logger.log("[tid: %d] Lock 0x%lx, segment %d. (now, depth: %d)", tid, MutexLock[tid], SegmentCount[tid], prevLocked - Unlocked + 1);
 	ReleaseLock(&Lock);
+
 	MutexLocked[tid] = DuringLockFunc;
 
 	PIN_CallApplicationFunction(ctxt, PIN_ThreadId(),
@@ -2708,8 +2973,11 @@ VOID* lockWrapper(CONTEXT *ctxt, AFUNPTR orig_function, THREADID tid, VOID* mute
 		PIN_PARG(VOID *), mutex, 
 		PIN_PARG_END());
 
-	MutexLocked[tid] = Locked;
-	MutexLock[tid] = mutex;
+	MutexLocked[tid] = prevLocked + 1;
+	MutexLock[tid][prevLocked - Unlocked] = mutex;
+	// if unlocked previously, MutexLock[tid][0] will be used.
+	// if locked1 previously, MutexLock[tid][1] will be used.
+	// and so on
 
 	// temp windy
 	//GetLock(&Lock, tid+1);
@@ -2814,6 +3082,7 @@ VOID* unlockWrapper(CONTEXT *ctxt, AFUNPTR orig_function, THREADID tid, VOID* mu
 	//LockBarrierResultBefore(tid);
 	// temp windy
 	//GetLock(&Lock, tid+1);
+	int prevLocked = MutexLocked[tid];
 	MutexLocked[tid] = DuringLockFunc;
 	//ReleaseLock(&Lock);
 
@@ -2824,11 +3093,20 @@ VOID* unlockWrapper(CONTEXT *ctxt, AFUNPTR orig_function, THREADID tid, VOID* mu
 		PIN_PARG_END());
 
 	GetLock(&Lock, tid+1);
-	Logger.log("[tid: %d] Unlock 0x%x, segment %d", tid, MutexLock[tid], SegmentCount[tid]);
+	Logger.log("[tid: %d] Unlock 0x%lx, segment %d. (now, depth: %d)", tid, MutexLock[tid], SegmentCount[tid], prevLocked - Locked1);
 	ReleaseLock(&Lock);
-	AutoInvForLock[tid] = false;
-	MutexLocked[tid] = Unlocked;
-	MutexLock[tid] = NULL;
+
+	MutexLocked[tid] = prevLocked - 1;
+	MutexLock[tid][prevLocked - Locked1] = NULL;
+	// if locked1 previously, MutexLock[tid][0] == NULL;
+	// if locked2 previously, MutexLock[tid][1] == NULL;
+	// and so on
+
+	// instead of 
+	// AutoInvForLock[tid] = false;
+	if (MutexLocked[tid] == Unlocked)
+		AutoInvForLock[tid] = false;
+
 	//ReleaseLock(&Lock);
 
 	//GetLock(&Lock, tid+1);
@@ -4456,12 +4734,14 @@ void AnalyzeBarrierRegion(int tid)
 	string s2;
 	vector<struct GlobalVariableStruct>::iterator	it;
 	set<ADDRINT>::iterator	wit;
+	gvmapit		myIt;
 
 	Logger.warn("[tid: %d] *** Analyzing unwritten-back writes", tid);
 	for (wit = WrittenWordsInThisEpoch[tid].begin(); wit != WrittenWordsInThisEpoch[tid].end(); wit++)
 	{
-		// check global variable
+		// check global variable		
 		BOOL done = false;
+		/*
 		for (it = GlobalVariableVec.begin(); it != GlobalVariableVec.end(); it++)
 		{
 			if ( (*wit >= (*it).addr) &&
@@ -4473,6 +4753,13 @@ void AnalyzeBarrierRegion(int tid)
 		}
 		if (done)
 			continue;
+		*/
+		myIt = isGlobalVariableIterator(*wit);
+		if (myIt != GlobalVariableMap.end()) {
+			Logger.warn("0x%lx for %s (offset 0x%x=%d) is not written back.", *wit, (myIt->second).name.c_str(), (int) (*wit - myIt->first), (int) (*wit - myIt->first));
+			continue;
+		}
+
 
 		// check allocated memory
 		s2 = MATracker.getVariableName(*wit);
@@ -4659,7 +4946,7 @@ void VallocAfter(THREADID tid, int ret)
 
 void lockWrapperBefore(THREADID tid)
 {
-	MutexLocked[tid] = Locked;
+	MutexLocked[tid] = Locked1;
 	Logger.log("[tid: %d] Lock", tid);
 }
 
@@ -4776,7 +5063,7 @@ VOID ReadsMemBefore (ADDRINT applicationIp, THREADID tid, ADDRINT memoryAddressR
 		// read access for local stack address
 		return; 
 
-	// return ;
+	return ;
 
 	INT32	col, line;
 	string	filename;
@@ -4824,7 +5111,7 @@ VOID ReadsMemBefore (ADDRINT applicationIp, THREADID tid, ADDRINT memoryAddressR
 						 (* bv )[j*2+1] == 0 ) {
 						// previously error, but this is not an error.
 						// guess this is set as an error for checking functionality.
-						Logger.error("[tid: %d] thread %d has dirty copy, but current thread tries to read with auto invalidation for address 0x%lx, name %s, base=0x%lx, offset=0x%x at line %d file %s",
+						Logger.error("[tid: %d] thread %d has a dirty copy, but current thread tries to read with auto invalidation for address 0x%lx, name %s, base=0x%lx, offset=0x%x at line %d file %s",
 							//	tid, j, a, MATracker.getVariableNameIndex(index).c_str(), MATracker.getBaseIndex(a, index), MATracker.getOffsetIndex(a, index), line, filename.c_str());
 							tid, j, a, MATracker.getVariableNameIterator(myIt).c_str(), MATracker.getBaseIterator(a, myIt), MATracker.getOffsetIterator(a, myIt), line, filename.c_str());
 					}						
@@ -4834,7 +5121,7 @@ VOID ReadsMemBefore (ADDRINT applicationIp, THREADID tid, ADDRINT memoryAddressR
 				// invalidation test
 				if ( (*bv )[tid*2] == 1) {
 					if ( (* bv )[tid*2+1] == 1) {
-						if ( ((MutexLocked[tid] == Locked) && AutoInvForLock[tid]) ||
+						if ( ((MutexLocked[tid] >= Locked1) && AutoInvForLock[tid]) ||
 							 ((MutexLocked[tid] == Unlocked) && AutoInvForEpoch[tid]) ) {
 						//if (AutoInvForLock[tid] || AutoInvForEpoch[tid]) {
 							// making it read valid with auto invalidation
@@ -4865,6 +5152,7 @@ VOID ReadsMemBefore (ADDRINT applicationIp, THREADID tid, ADDRINT memoryAddressR
 			}
 			ReleaseLock(&Lock);
 		}
+		/*
 		else if (isGlobalVariable(memoryAddressRead)) {
 			// else if read is from global memory
 			ReleaseLock(&Lock);
@@ -4934,11 +5222,84 @@ VOID ReadsMemBefore (ADDRINT applicationIp, THREADID tid, ADDRINT memoryAddressR
 				}
 			}	// end of for loop
 		}	// if global variable
+		*/
 		else {
-			// if the memory location is not within allocated area and global area,
-			// we need to release the lock anyway.
 			ReleaseLock(&Lock);
-		}
+
+			gvmapit myIt = isGlobalVariableIterator(memoryAddressRead);
+			if (myIt != GlobalVariableMap.end()) {
+				NumReads[tid].count++;
+
+				// commented out for potential overhead
+				//if (MutexLocked[tid] == Locked)
+				//	Logger.ext_debug("[tid: %d] epoch: %d Locked / Read address = 0x%lx", tid, BarrierCount, memoryAddressRead);
+				//else
+				//	Logger.ext_debug("[tid: %d] epoch: %d Read address = 0x%lx", tid, BarrierCount, memoryAddressRead);
+
+				startWordAddress = memoryAddressRead & ADDR_MASK;
+				//endWordAddress = (memoryAddressRead + memoryReadSize) & ADDR_MASK;
+				//startOffset = memoryAddressRead & offsetMask;
+
+				for (ADDRINT a = startWordAddress; a < memoryAddressRead + memoryReadSize; a += WORD_BYTES)
+				{
+					//	Logger.warn("[tid: %d] read : %s, %lx", tid, getGlobalVariableName(a), a);
+					// if others have dirty valid copy, 
+					// this is probably problematic. 
+					// Either
+					// i) missing writeback from others in previous epoch
+					// ii) failure to analyze OCC
+
+					for (UINT32 j = 0; j < MAX_THREADS; j++)
+					{
+						if (j == tid) continue;
+						if ( (* (bitVectorForGlobalVariableIterator(a, myIt)) )[j*2  ] == 1 &&
+							 (* (bitVectorForGlobalVariableIterator(a, myIt)) )[j*2+1] == 0 ) {
+
+							// this case is a data race. 
+							// this may be caused by potential miss of writeback from other cores.
+							GetLock(&Lock, tid+1);
+							Logger.error("[tid: %d] thread %d has a dirty copy, but current thread tries to read with auto invalidation for address 0x%lx, name %s, base=0x%lx, offset=0x%x at line %d file %s",
+							tid, j, a, getGlobalVariableNameIterator(myIt), baseInGlobalVariableIterator(a, myIt), offsetInGlobalVariableIterator(a, myIt), line, filename.c_str());
+							ReleaseLock(&Lock);
+						}						
+					}
+
+					// invalidation test
+					if ( (* (bitVectorForGlobalVariableIterator(a, myIt)) )[tid*2] == 1) {
+						if ( (* (bitVectorForGlobalVariableIterator(a, myIt)) )[tid*2+1] == 1) {
+
+							if ( ((MutexLocked[tid] >= Locked1) && AutoInvForLock[tid]) ||
+								 ((MutexLocked[tid] == Unlocked) && AutoInvForEpoch[tid]) ) {
+								// making it read valid with auto invalidation
+								(* (bitVectorForGlobalVariableIterator(a, myIt)) )[tid*2  ] = 0;
+								(* (bitVectorForGlobalVariableIterator(a, myIt)) )[tid*2+1] = 1;
+								GetLock(&Lock, tid+1);
+								Logger.log("[tid: %d] auto invalidated for address 0x%lx, allocated to name:%s, base=0x%lx offset=0x%x", 
+									tid, a, getGlobalVariableNameIterator(myIt), baseInGlobalVariableIterator(a, myIt), offsetInGlobalVariableIterator(a, myIt));
+								ReleaseLock(&Lock);
+								continue;
+							}
+
+							// means 'need invalidation'
+							GetLock(&Lock, tid+1);
+							Logger.error("[tid: %d] read without invalidation: addr=0x%lx, %s (offset %ld 0x%lx), read at line %d file %s", 
+								tid, a, getGlobalVariableNameIterator(myIt), offsetInGlobalVariableIterator(a, myIt), offsetInGlobalVariableIterator(a, myIt), line, filename.c_str());
+							ReleaseLock(&Lock);
+						}
+					}
+					else if ( (* (bitVectorForGlobalVariableIterator(a, myIt)) )[tid*2+1] == 0) {
+						// means currently invalid state
+						Logger.ext_debug("read at unloaded state");
+						(* (bitVectorForGlobalVariableIterator(a, myIt)) )[tid*2+1] = 1;	// change to read valid state
+					}
+				}	// end of for loop
+			}	// if global variable
+			else {
+				// if the memory location is not within allocated area and global area,
+				// we need to release the lock anyway.
+				//ReleaseLock(&Lock);
+			}
+		}	// if else (global or others)
 	}	// if (checkEnabled)	
 }
 
@@ -4977,7 +5338,7 @@ VOID WritesMemBefore(ADDRINT applicationIp, THREADID tid, ADDRINT memoryAddressW
 			// and if not related to allocation, we are not interested in stack accesses.
 			return;
 
-	// return ;
+	//return ;
 
 	INT32	col, line;
 	string	filename;
@@ -4989,6 +5350,7 @@ VOID WritesMemBefore(ADDRINT applicationIp, THREADID tid, ADDRINT memoryAddressW
 		PIN_GetSourceLocation(applicationIp, &col, &line, &filename);
 		PIN_UnlockClient();
 	}
+	//goto HERE;
 
 
 	if (CheckEnabled) {
@@ -5031,7 +5393,7 @@ VOID WritesMemBefore(ADDRINT applicationIp, THREADID tid, ADDRINT memoryAddressW
 
 			for (ADDRINT a = startWordAddress; a < memoryAddressWrite + memoryWriteSize; a += WORD_BYTES)
 			{
-				if (MutexLocked[tid] == Locked) {
+				if (MutexLocked[tid] >= Locked1) {
 					// add this word to written words group
 					// the following code is for vector or list.
 					// since this requires additional care for duplicated copy, we use set instead.
@@ -5114,6 +5476,7 @@ VOID WritesMemBefore(ADDRINT applicationIp, THREADID tid, ADDRINT memoryAddressW
 
 			ReleaseLock(&Lock);
 		}	// end of heap-allocated memory processing
+		/*
 		else if (isGlobalVariable(memoryAddressWrite)) {
 			// This is not dynamically changing data structure, so that we can assume no problems of thread-safety.
 			// For general global memory variables, written words should be recorded.
@@ -5191,11 +5554,91 @@ VOID WritesMemBefore(ADDRINT applicationIp, THREADID tid, ADDRINT memoryAddressW
 				}
 			}	// end of for loop
 		}	// if global variable
+		*/
 		else {
-			// if the memory location is not within allocated area and global area,
-			// we need to release the lock anyway.
 			ReleaseLock(&Lock);
-		}
+
+			gvmapit myIt = isGlobalVariableIterator(memoryAddressWrite);
+
+			if (myIt != GlobalVariableMap.end()) {
+				// we have global variable match.
+				// This is not dynamically changing data structure, so that we can assume no problems of thread-safety.
+				// For general global memory variables, written words should be recorded.
+				NumWrites[tid].count++;
+
+				// commented out for performance
+				//if (MutexLocked[tid] == Locked)
+				//	Logger.ext_debug("[tid: %d] epoch: %d Locked / Write address = 0x%lx to %s",
+				//		tid, BarrierCount, memoryAddressWrite, getGlobalVariableNameIterator(myIt));
+				//else
+				//	Logger.ext_debug("[tid: %d] epoch:%d Write address = 0x%lx to %s",
+				//		tid, BarrierCount, memoryAddressWrite, getGlobalVariableNameIterator(myIt));
+
+				startWordAddress = memoryAddressWrite & ADDR_MASK;
+				//endWordAddress = (memoryAddressWrite + memoryWriteSize) & ADDR_MASK;
+				//startOffset = memoryAddressWrite & offsetMask;
+
+				for (ADDRINT a = startWordAddress; a < memoryAddressWrite + memoryWriteSize; a += WORD_BYTES)
+				{
+					if (MutexLocked[tid] >= Locked1) {
+				
+						//for (WrittenWordsIterator[tid] = WrittenWordsInThisLock[tid].begin(); WrittenWordsIterator[tid] != WrittenWordsInThisEpoch[tid].end(); WrittenWordsIterator[tid]++)
+						//{
+						//	if (*WrittenWordsIterator[tid] == a)
+						//		break;
+						//}
+						//
+						//if (WrittenWordsIterator[tid] == WrittenWordsInThisLock[tid].end())
+						//	// if not added yet, add it
+						//	WrittenWordsInThisLock[tid].push_back(a);
+				
+						// set implementation
+						WrittenWordsInThisLock[tid].insert(a);
+					}
+					else {
+		
+						//for (WrittenWordsIterator[tid] = WrittenWordsInThisEpoch[tid].begin(); WrittenWordsIterator[tid] != WrittenWordsInThisEpoch[tid].end(); WrittenWordsIterator[tid]++)
+						//{
+						//	if (*WrittenWordsIterator[tid] == a)
+						//		break;
+						//}
+						//
+						//if (WrittenWordsIterator[tid] == WrittenWordsInThisEpoch[tid].end())
+						//	// if not added yet, add it
+						//	WrittenWordsInThisEpoch[tid].push_back(a);
+
+						// set implementation
+						WrittenWordsInThisEpoch[tid].insert(a);
+					}
+	
+					if ( (* (bitVectorForGlobalVariableIterator(a, myIt)) )[tid*2] == 1) {
+						if ( (* (bitVectorForGlobalVariableIterator(a, myIt)) )[tid*2+1] == 1) {
+							// means 'need invalidation'
+							GetLock(&Lock, tid+1);
+							Logger.warn("[tid: %d] write without invalidation: %s (offset: %ld 0x%lx)", tid, getGlobalVariableNameIterator(myIt), offsetInGlobalVariableIterator(a, myIt), offsetInGlobalVariableIterator(a, myIt));
+							ReleaseLock(&Lock);
+						}
+					}
+					else if ( (* (bitVectorForGlobalVariableIterator(a, myIt)) )[tid*2+1] == 0) {
+						// means currently invalid state
+						Logger.ext_debug("write at unloaded state");
+						(* (bitVectorForGlobalVariableIterator(a, myIt)) )[tid*2] = 1;
+						(* (bitVectorForGlobalVariableIterator(a, myIt)) )[tid*2+1] = 0;
+						//Logger.ext_debug("check2 %s", (bitVectorForGlobalVariable(0x6064a0))->to_string().c_str());
+					}
+					else if ( (* (bitVectorForGlobalVariableIterator(a, myIt)) )[tid*2+1] == 1) {
+						// means currently read valid state
+						Logger.ext_debug("write at read valid state");
+						(* (bitVectorForGlobalVariableIterator(a, myIt)) )[tid*2] = 1;
+						(* (bitVectorForGlobalVariableIterator(a, myIt)) )[tid*2+1] = 0;
+					}
+				}	// end of for loop
+			}	// if global variable
+			else {
+				// if the memory location is not within allocated area and global area,
+				// lock is already released.
+			}
+		}	// if else (global or others)
 	}	// if (CheckEnabled)
 
 //HERE:
@@ -5231,6 +5674,7 @@ VOID WritesMemBefore(ADDRINT applicationIp, THREADID tid, ADDRINT memoryAddressW
 
 			// Global variable tracing
 			//printf("[DEBUG] allocation 0x%lx\n", memoryAddressWrite);
+			/*
 			Logger.log("[tid: %d] memory allocation to addr 0x%lx", tid, memoryAddressWrite);
 			bool done = false;
 			for (GlobalVariableVecIterator = GlobalVariableVec.begin(); GlobalVariableVecIterator != GlobalVariableVec.end(); GlobalVariableVecIterator++)
@@ -5251,10 +5695,28 @@ VOID WritesMemBefore(ADDRINT applicationIp, THREADID tid, ADDRINT memoryAddressW
 					break;
 				}
 			}
-
-			// if not matched to any previous global variable, this should be named as 'noname'
-			if (done == false)
+			*/
+			Logger.log("[tid: %d] memory allocation to addr 0x%lx", tid, memoryAddressWrite);
+			gvmapit it;
+			it = isGlobalVariableIterator(memoryAddressWrite);
+			if (it != GlobalVariableMap.end()) {
+				if (it->first == memoryAddressWrite) {
+					// startAddress 
+					MATracker.addVariableName(it->second.name, 0);
+					it->second.allocAddr = MATracker.prevAddr;
+					it->second.allocSize = MATracker.prevSize;
+					//(*GlobalVariableVecIterator).attachState();
+				}
+				else {
+					// not a start address
+					int offset = ((it->second).addr + (it->second).size - memoryAddressWrite) / WORD_BYTES;
+					MATracker.addVariableName((it->second.name), offset);
+				}
+			}
+			else {
+				// if not matched to any previous global variable, this should be named as 'noname'
 				MATracker.addVariableName("Noname", 0);
+			}
 
 			AfterAlloc[tid] = false;
 		}
@@ -5274,6 +5736,11 @@ VOID Instruction(INS ins, void * v)
 	// Finally, we will target parall worker threads only, which has threadid > 0.
 	// This requires SESC to equip processor 0 with ideal memory, and instrumenting function drops its job in case of threadid 0.
 	// At this moment, instrumentation targets all threads including main thread.
+
+	// for other use of debugging
+	//if (INS_IsBranch(ins) || INS_IsCall(ins) || INS_IsRet(ins)) {
+	//	beforeBranch[IARG_THREAD_ID] = INS_Address(ins);
+	//}
 
 	//UINT32 tid = PIN_ThreadId();
 	//GetLock(&Lock, tid+1);
@@ -5404,13 +5871,14 @@ VOID FinalAnalysis()
 	vector<struct GlobalVariableStruct>::iterator	it;
 	set<ADDRINT>::iterator		wit;
 	BOOL	done;
+	gvmapit		myIt;
 
 	for (int i = 0; i < MaxThreads; i++) {
 		Logger.log("In thread %d,\n", i);
 		for (wit = WrittenWordsInThisEpoch[i].begin(); wit != WrittenWordsInThisEpoch[i].end(); wit++)
 		{
 			// check global variable
-			done = false;
+			/*
 			for (it = GlobalVariableVec.begin(); it != GlobalVariableVec.end(); it++)
 			{
 				if ( (*wit >= (*it).addr) &&
@@ -5422,6 +5890,12 @@ VOID FinalAnalysis()
 			}
 			if (done)
 				continue;
+			*/
+			myIt = isGlobalVariableIterator(*wit);
+			if (myIt != GlobalVariableMap.end()) {
+				Logger.warn("0x%lx for %s (offset 0x%x=%d) is not written back.", *wit, (myIt->second).name.c_str(), (int) (*wit - myIt->first), (int) (*wit - myIt->first));
+				continue;
+			}
 
 			// check allocated memory
 			s2 = MATracker.getVariableName(*wit);
@@ -5523,7 +5997,8 @@ VOID ReadVariableInfo(char *filename)
 				continue;
 		}
 		name = id;
-		GlobalVariableVec.push_back(GlobalVariableStruct(name, addr, size, 0, 0));
+		//GlobalVariableVec.push_back(GlobalVariableStruct(name, addr, size, 0, 0));
+		GlobalVariableMap[addr] = GlobalVariableStruct(name, addr, size, 0, 0);
 	}		
 
 	fclose(fp);
@@ -5781,16 +6256,20 @@ int main(int argc, char * argv[])
 		SegmentCount[i] = 0;
 		AutoInvForLock[i] = false;
 		AutoInvForEpoch[i] = false;
+		MutexLocked[i] = Unlocked;
 	}
 
 	ReadVariableInfo(VariableFileName);
 	Logger.log("*** Global Variable List starts");
-	for (GlobalVariableVecIterator = GlobalVariableVec.begin(); GlobalVariableVecIterator != GlobalVariableVec.end(); GlobalVariableVecIterator++) 
+	//for (GlobalVariableVecIterator = GlobalVariableVec.begin(); GlobalVariableVecIterator != GlobalVariableVec.end(); GlobalVariableVecIterator++) 
+	//{
+	//	Logger.log("%s: addr=0x%lx, len=0x%x", (*GlobalVariableVecIterator).name.c_str(), (*GlobalVariableVecIterator).addr, (*GlobalVariableVecIterator).size);
+	//}
+	for (GlobalVariableMapIterator = GlobalVariableMap.begin(); GlobalVariableMapIterator != GlobalVariableMap.end(); GlobalVariableMapIterator++) 
 	{
-		Logger.log("%s: addr=0x%lx, len=0x%x", (*GlobalVariableVecIterator).name.c_str(), (*GlobalVariableVecIterator).addr, (*GlobalVariableVecIterator).size);
+		Logger.log("%s: addr=0x%lx, len=0x%x", (GlobalVariableMapIterator->second).name.c_str(), (GlobalVariableMapIterator->second).addr, (GlobalVariableMapIterator->second).size);
 	}
 	Logger.log("*** Global Variable List ends\n");
-
 
 	// Instrumentation
 	// At image level,
